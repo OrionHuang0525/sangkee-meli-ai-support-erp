@@ -1,0 +1,10 @@
+node_modules
+**/node_modules
+**/.next
+**/dist
+**/*.tsbuildinfo
+.git
+.idea
+.env
+postgres_data
+redis_data

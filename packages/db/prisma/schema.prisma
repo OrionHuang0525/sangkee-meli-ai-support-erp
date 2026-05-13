@@ -1,0 +1,367 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Shop {
+  id           String   @id @default(uuid()) @db.Uuid
+  sellerId     BigInt   @unique @map("seller_id")
+  siteId       String   @default("MLM") @map("site_id") @db.VarChar(10)
+  nickname     String?  @db.VarChar(255)
+  status       String   @default("active") @db.VarChar(30)
+  authorizedAt DateTime? @map("authorized_at") @db.Timestamptz
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  tokens           MeliToken[]
+  presaleQuestions PresaleQuestion[]
+  aftersaleThreads AftersaleThread[]
+  messages         Message[]
+  aiSuggestions    AiSuggestion[]
+  kbDocuments      KbDocument[]
+  kbChunks         KbChunk[]
+  skuKnowledge     SkuKnowledge[]
+  apiCallLogs      ApiCallLog[]
+  operationLogs    OperationLog[]
+  settingsRules    SettingsRule[]
+  members          ShopMember[]
+  ipPolicies       ShopIpPolicy[]
+  replyTemplates   ReplyTemplate[]
+
+  @@map("shops")
+}
+
+model AppUser {
+  id        String   @id @default(uuid()) @db.Uuid
+  email     String   @unique @db.VarChar(255)
+  name      String?  @db.VarChar(120)
+  role      String   @default("operator") @db.VarChar(30)
+  status    String   @default("active") @db.VarChar(30)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  memberships  ShopMember[]
+  operationLogs OperationLog[]
+
+  @@map("app_users")
+}
+
+model ShopMember {
+  id        String   @id @default(uuid()) @db.Uuid
+  shopId    String   @map("shop_id") @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  role      String   @default("operator") @db.VarChar(30)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  user AppUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([shopId, userId])
+  @@index([userId, active])
+  @@map("shop_members")
+}
+
+model ShopIpPolicy {
+  id        String   @id @default(uuid()) @db.Uuid
+  shopId    String   @map("shop_id") @db.Uuid
+  label     String?  @db.VarChar(120)
+  cidr      String   @db.VarChar(80)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@index([shopId, active])
+  @@map("shop_ip_policies")
+}
+
+model MeliToken {
+  id              String   @id @default(uuid()) @db.Uuid
+  shopId          String   @map("shop_id") @db.Uuid
+  accessTokenEnc  String   @map("access_token_enc")
+  refreshTokenEnc String   @map("refresh_token_enc")
+  scope           String?
+  expiresAt       DateTime @map("expires_at") @db.Timestamptz
+  lastRefreshAt   DateTime? @map("last_refresh_at") @db.Timestamptz
+  refreshError    String?  @map("refresh_error")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@map("meli_tokens")
+}
+
+model WebhookEvent {
+  id            String   @id @default(uuid()) @db.Uuid
+  topic         String   @db.VarChar(80)
+  resource      String
+  userId        BigInt?  @map("user_id")
+  applicationId BigInt?  @map("application_id")
+  attempts      Int      @default(0)
+  rawPayload    Json     @map("raw_payload")
+  status        String   @default("pending") @db.VarChar(30)
+  dedupeKey     String?  @unique @map("dedupe_key")
+  receivedAt    DateTime @default(now()) @map("received_at") @db.Timestamptz
+  processedAt   DateTime? @map("processed_at") @db.Timestamptz
+  error         String?
+
+  @@index([topic, status])
+  @@map("webhook_events")
+}
+
+model PresaleQuestion {
+  id             String   @id @default(uuid()) @db.Uuid
+  shopId         String   @map("shop_id") @db.Uuid
+  questionId     BigInt   @unique @map("question_id")
+  itemId         String   @map("item_id") @db.VarChar(50)
+  buyerId        BigInt?  @map("buyer_id")
+  questionText   String?  @map("question_text")
+  questionStatus String?  @map("question_status") @db.VarChar(50)
+  aiDraft        String?  @map("ai_draft")
+  aiConfidence   Decimal? @map("ai_confidence") @db.Decimal(5, 2)
+  riskLevel      String?  @default("low") @map("risk_level") @db.VarChar(20)
+  reviewStatus   String   @default("pending") @map("review_status") @db.VarChar(30)
+  finalAnswer    String?  @map("final_answer")
+  sentAt         DateTime? @map("sent_at") @db.Timestamptz
+  rawQuestion    Json?    @map("raw_question")
+  rawItem        Json?    @map("raw_item")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@index([shopId, reviewStatus])
+  @@map("presale_questions")
+}
+
+model AftersaleThread {
+  id              String   @id @default(uuid()) @db.Uuid
+  shopId          String   @map("shop_id") @db.Uuid
+  packId          BigInt   @map("pack_id")
+  orderId         BigInt?  @map("order_id")
+  buyerId         BigInt?  @map("buyer_id")
+  status          String   @default("open") @db.VarChar(30)
+  category        String?  @db.VarChar(50)
+  riskLevel       String?  @map("risk_level") @db.VarChar(20)
+  summary         String?
+  suggestedAction String?  @map("suggested_action")
+  suggestedReply  String?  @map("suggested_reply")
+  claimId         BigInt?  @map("claim_id")
+  returnId        BigInt?  @map("return_id")
+  lastMessageAt   DateTime? @map("last_message_at") @db.Timestamptz
+  rawContext      Json?    @map("raw_context")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  shop     Shop      @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  messages Message[]
+
+  @@unique([shopId, packId])
+  @@index([shopId, status, riskLevel])
+  @@map("aftersale_threads")
+}
+
+model Message {
+  id            String   @id @default(uuid()) @db.Uuid
+  shopId        String   @map("shop_id") @db.Uuid
+  threadId      String?  @map("thread_id") @db.Uuid
+  meliMessageId String?  @unique @map("meli_message_id")
+  packId        BigInt?  @map("pack_id")
+  senderUserId  BigInt?  @map("sender_user_id")
+  receiverUserId BigInt? @map("receiver_user_id")
+  direction     String?  @db.VarChar(20)
+  text          String?
+  rawMessage    Json?    @map("raw_message")
+  messageDate   DateTime? @map("message_date") @db.Timestamptz
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  shop   Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  thread AftersaleThread? @relation(fields: [threadId], references: [id], onDelete: SetNull)
+
+  @@index([shopId, packId])
+  @@map("messages")
+}
+
+model AiSuggestion {
+  id            String   @id @default(uuid()) @db.Uuid
+  shopId        String   @map("shop_id") @db.Uuid
+  targetType    String   @map("target_type") @db.VarChar(30)
+  targetId      String   @map("target_id") @db.Uuid
+  model         String?  @db.VarChar(100)
+  promptVersion String?  @map("prompt_version") @db.VarChar(50)
+  inputSnapshot Json     @map("input_snapshot")
+  outputJson    Json?    @map("output_json")
+  outputText    String?  @map("output_text")
+  riskFlags     String[] @map("risk_flags")
+  accepted      Boolean?
+  editedText    String?  @map("edited_text")
+  createdBy     String?  @map("created_by") @db.Uuid
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@index([shopId, targetType, targetId])
+  @@map("ai_suggestions")
+}
+
+model KbDocument {
+  id        String   @id @default(uuid()) @db.Uuid
+  shopId    String?  @map("shop_id") @db.Uuid
+  title     String
+  docType   String   @map("doc_type") @db.VarChar(50)
+  content   String
+  locale    String   @default("es-MX") @db.VarChar(10)
+  status    String   @default("indexed") @db.VarChar(30)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  shop   Shop? @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  chunks KbChunk[]
+
+  @@index([shopId, docType, active])
+  @@map("kb_documents")
+}
+
+model KbChunk {
+  id         String   @id @default(uuid()) @db.Uuid
+  documentId String   @map("document_id") @db.Uuid
+  shopId     String?  @map("shop_id") @db.Uuid
+  content    String
+  embedding  Unsupported("vector(1536)")?
+  metadata   Json?
+  scoreHint  Decimal? @map("score_hint") @db.Decimal(5, 2)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  document KbDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  shop     Shop?      @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@index([shopId])
+  @@map("kb_chunks")
+}
+
+model SkuKnowledge {
+  id             String   @id @default(uuid()) @db.Uuid
+  shopId         String?  @map("shop_id") @db.Uuid
+  sku            String   @db.VarChar(100)
+  itemId         String?  @map("item_id") @db.VarChar(80)
+  title          String
+  brand          String?  @db.VarChar(120)
+  category       String?  @db.VarChar(120)
+  locale         String   @default("es-MX") @db.VarChar(10)
+  sellingPoints  String?  @map("selling_points")
+  faq            String?
+  warrantyPolicy String?  @map("warranty_policy")
+  invoicePolicy  String?  @map("invoice_policy")
+  shippingNotes  String?  @map("shipping_notes")
+  returnPolicy   String?  @map("return_policy")
+  forbiddenNotes String?  @map("forbidden_notes")
+  attributes     Json?
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  shop Shop? @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@unique([shopId, sku])
+  @@index([shopId, itemId])
+  @@index([shopId, active])
+  @@map("sku_knowledge")
+}
+
+model ApiCallLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  shopId     String?  @map("shop_id") @db.Uuid
+  method     String   @db.VarChar(10)
+  path       String
+  statusCode Int?     @map("status_code")
+  requestId  String?  @map("request_id")
+  latencyMs  Int?     @map("latency_ms")
+  error      String?
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  shop Shop? @relation(fields: [shopId], references: [id], onDelete: SetNull)
+
+  @@index([shopId, createdAt])
+  @@map("api_call_logs")
+}
+
+model OperationLog {
+  id          String   @id @default(uuid()) @db.Uuid
+  shopId      String?  @map("shop_id") @db.Uuid
+  actorId     String?  @map("actor_id") @db.Uuid
+  action      String   @db.VarChar(80)
+  targetType  String   @map("target_type") @db.VarChar(50)
+  targetId    String?  @map("target_id") @db.Uuid
+  detail      Json?
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  shop Shop? @relation(fields: [shopId], references: [id], onDelete: SetNull)
+  actor AppUser? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([shopId, action, createdAt])
+  @@map("operation_logs")
+}
+
+model SettingsRule {
+  id        String   @id @default(uuid()) @db.Uuid
+  shopId    String?  @map("shop_id") @db.Uuid
+  key       String   @db.VarChar(120)
+  value     Json
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  shop Shop? @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@unique([shopId, key])
+  @@map("settings_rules")
+}
+
+model ReplyTemplate {
+  id             String   @id @default(uuid()) @db.Uuid
+  shopId         String   @map("shop_id") @db.Uuid
+  name           String   @db.VarChar(160)
+  intentCode     String   @map("intent_code") @db.VarChar(80)
+  category       String   @db.VarChar(80)
+  language       String   @default("es-MX") @db.VarChar(10)
+  scenario       String?  @db.VarChar(160)
+  keywords       String[]
+  content        String
+  variables      String[]
+  active         Boolean  @default(true)
+  requiresReview Boolean  @default(true) @map("requires_review")
+  version        Int      @default(1)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  shop     Shop                   @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  versions ReplyTemplateVersion[]
+
+  @@unique([shopId, name, version])
+  @@index([shopId, intentCode, active])
+  @@map("reply_templates")
+}
+
+model ReplyTemplateVersion {
+  id         String   @id @default(uuid()) @db.Uuid
+  templateId String   @map("template_id") @db.Uuid
+  version    Int
+  content    String
+  changedBy  String?  @map("changed_by") @db.Uuid
+  note       String?
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  template ReplyTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@unique([templateId, version])
+  @@map("reply_template_versions")
+}

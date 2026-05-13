@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "sourceMap": true,
+    "baseUrl": ".",
+    "paths": {
+      "@meli-ai-support/shared": ["packages/shared/src/index.ts"],
+      "@meli-ai-support/db": ["packages/db/src/index.ts"],
+      "@meli-ai-support/meli-client": ["packages/meli-client/src/index.ts"],
+      "@meli-ai-support/ai-core": ["packages/ai-core/src/index.ts"]
+    }
+  }
+}

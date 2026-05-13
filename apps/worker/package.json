@@ -1,0 +1,20 @@
+{
+  "name": "@meli-ai-support/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/worker.ts",
+    "start": "node dist/apps/worker/src/worker.js",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@meli-ai-support/ai-core": "workspace:*",
+    "@meli-ai-support/db": "workspace:*",
+    "@meli-ai-support/shared": "workspace:*",
+    "bullmq": "^5.51.1",
+    "ioredis": "^5.6.1"
+  }
+}

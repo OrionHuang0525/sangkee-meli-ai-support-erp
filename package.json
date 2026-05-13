@@ -1,0 +1,26 @@
+{
+  "name": "meli-ai-support",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "corepack pnpm --parallel --filter @meli-ai-support/api --filter @meli-ai-support/worker --filter @meli-ai-support/web dev",
+    "dev:api": "corepack pnpm --filter @meli-ai-support/api dev",
+    "dev:worker": "corepack pnpm --filter @meli-ai-support/worker dev",
+    "dev:web": "corepack pnpm --filter @meli-ai-support/web dev",
+    "build": "corepack pnpm -r build",
+    "typecheck": "corepack pnpm -r typecheck",
+    "lint": "corepack pnpm -r lint",
+    "db:generate": "corepack pnpm --filter @meli-ai-support/db prisma:generate",
+    "db:migrate": "corepack pnpm --filter @meli-ai-support/db prisma:migrate",
+    "db:studio": "corepack pnpm --filter @meli-ai-support/db prisma:studio"
+  },
+  "packageManager": "pnpm@9.15.4",
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}

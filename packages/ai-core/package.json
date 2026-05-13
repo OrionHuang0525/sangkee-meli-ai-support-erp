@@ -1,0 +1,17 @@
+{
+  "name": "@meli-ai-support/ai-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/ai-core/src/index.js",
+  "types": "dist/ai-core/src/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@meli-ai-support/shared": "workspace:*",
+    "zod": "^3.24.4"
+  }
+}

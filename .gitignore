@@ -1,0 +1,13 @@
+node_modules/
+.next/
+dist/
+coverage/
+.env
+.env.local
+*.log
+*.tsbuildinfo
+.idea/
+**/.next/
+**/dist/
+postgres_data/
+redis_data/
