@@ -35,6 +35,7 @@ export const AftersaleCategorySchema = z.enum([
   "refund_request",
   "invoice_request",
   "warranty",
+  "human_request",
   "claim_opened",
   "negative_feedback_risk",
   "buyer_abuse",

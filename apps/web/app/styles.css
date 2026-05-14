@@ -139,7 +139,8 @@ h3 {
 
 .top-actions,
 .toolbar,
-.button-row {
+.button-row,
+.action-group {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -244,6 +245,37 @@ article,
   padding: 0 14px;
 }
 
+.queue-action {
+  width: 100%;
+  margin: 10px 0;
+  padding: 0 12px;
+  border-color: #2865d9;
+  color: #245cc5;
+  font-weight: 700;
+}
+
+.action-stack {
+  display: grid;
+  gap: 10px;
+}
+
+.action-group {
+  align-items: stretch;
+}
+
+.action-group span {
+  display: inline-flex;
+  align-items: center;
+  min-width: 68px;
+  color: #66768c;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.action-group button {
+  padding: 0 12px;
+}
+
 .status-item {
   display: flex;
   align-items: center;
@@ -316,6 +348,11 @@ article,
   text-align: left;
 }
 
+.queue-card.active {
+  border-color: #2f6fed;
+  background: #eef5ff;
+}
+
 .queue-card span,
 .queue-card em {
   color: #66768c;
@@ -368,6 +405,12 @@ article,
 
 .plain-list li {
   margin: 6px 0;
+}
+
+.plain-list p {
+  margin: 4px 0 0;
+  color: #5b6b80;
+  font-size: 12px;
 }
 
 .empty-state {
@@ -435,6 +478,10 @@ textarea {
 
 .table-wrap {
   overflow: auto;
+}
+
+.table-wrap h2 {
+  padding: 14px 14px 4px;
 }
 
 table {

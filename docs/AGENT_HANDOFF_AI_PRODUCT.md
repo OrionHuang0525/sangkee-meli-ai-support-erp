@@ -555,6 +555,64 @@ IP 隔离：
 - 如果业务要求不同店铺走不同出口 IP，应在后端 HTTP client 层支持 per-shop egress proxy。
 - 这属于平台对接层能力，不应该让前端感知。
 
+## 11.1 本轮新增进展（2026-05-13）
+
+已完成：
+
+- 前端工作台源文件重写，修复乱码，导航保持：今日工作、买家咨询、售后处理、回复审核、知识库、预设回复、处理统计、店铺设置。
+- 前端不再展示 RAG、Chunk、Embedding、Provider、Token、tenant、storeId、Kimi、API Key 等底层词汇。
+- 后端新增飞书机器人地址配置：`GET /settings/feishu-webhook`、`POST /settings/feishu-webhook`、`POST /settings/feishu-webhook/test`。
+- 飞书配置加密保存到 `settings_rules`，只返回脱敏状态。
+- 后端新增客服助手自动化策略：`GET /settings/automation`、`POST /settings/automation`，默认 `autoReplyMode=off`。
+- 后端新增售前一键审批低风险建议：`POST /presale/questions/bulk-approve`。
+- 后端新增售后发送骨架：`POST /aftersale/threads/:id/send`，当前仍为 dry-run/审计记录。
+- Mercado webhook 收到 `questions/messages/claims` 后，会按店铺配置非阻塞推送飞书提醒；失败不阻塞 webhook 返回。
+- Docker 镜像已重建并重启：api、web、worker。
+
+已验证：
+
+- `corepack pnpm --filter @meli-ai-support/api typecheck`
+- `corepack pnpm --filter @meli-ai-support/web typecheck`
+- `corepack pnpm --filter @meli-ai-support/worker typecheck`
+- `corepack pnpm build`
+- `GET /health`
+- `GET /dashboard`
+- `GET /settings/feishu-webhook`
+- `POST /settings/automation`
+- `POST /kb/search`
+- `POST /presale/questions/bulk-approve`
+- `POST /ai/test` 当前返回 Kimi/Moonshot 401，说明环境里的模型密钥不可用或已失效；不要在文档或前端回显密钥，下一位 Agent 需要让管理员替换后重测。
+- 本地浏览器打开 `http://127.0.0.1:3000`，导航中文正常、无前端 Console error、无底层技术词暴露。
+
+## 11.2 本轮新增进展（2026-05-13，NVIDIA 模型接入）
+
+已完成：
+
+- 后端模型调用层支持 `AI_PROVIDER=nvidia`。
+- 新增 NVIDIA Integrate 环境变量：`NVIDIA_API_KEY`、`NVIDIA_BASE_URL`、`NVIDIA_MODEL`、`NVIDIA_STREAM`、`NVIDIA_THINKING`、`NVIDIA_MAX_TOKENS`。
+- 默认 NVIDIA endpoint 为 `https://integrate.api.nvidia.com/v1`，默认模型为 `moonshotai/kimi-k2.6`。
+- NVIDIA 调用会传入 `chat_template_kwargs: { thinking: true }`。
+- `GET /health`、`GET /settings/ai` 会返回当前 provider/model/baseUrl/stream/configured 状态，但不会返回密钥。
+- `/ai/test`、知识库 agentic chunk、售前生成、售后分析现在共用同一套模型 runtime。
+
+当前结论：
+
+- Agentic RAG 业务链路已接好：资料导入 -> agentic chunk/fallback chunk -> `kb_chunks` 入库 -> `/kb/search` 词法召回 -> 售前/售后生成携带 `ragHits`。
+- 还不是完整向量 RAG：`embedding` 字段尚未写入，检索仍是 lexical/hybrid 前的 MVP 版本。
+- 真实模型链路是否跑通取决于后端 `.env` 中有效的 `NVIDIA_API_KEY`，不要把真实 key 写入文档或前端。
+
+## 11.3 本轮新增进展（2026-05-13，售前知识库与真实发送）
+
+已完成：
+
+- 知识库定位调整为“售前 AI 知识库”，只参与买家咨询/售前回复生成。
+- 售后分析不再调用售前 RAG 检索，改为订单上下文、风险规则和预设回复模板。
+- 新增知识库删除 API：`DELETE /kb/skus/:id`、`DELETE /kb/documents/:id`。
+- 删除文本资料时会级联删除对应 `kb_chunks`；删除商品资料后售前 AI 不再引用该 SKU 资料。
+- 售前发送接口补齐真实 Mercado Libre `POST /answers` 调用路径；默认仍受 `AUTO_SEND_PRESALE=true` 开关保护。
+- 前端知识库页拆成商品资料、文本资料、售前匹配测试、商品资料列表、文本资料列表，并提供删除按钮。
+- 前端售前回复区支持编辑后审核、记录发送和发送到平台。
+
 ## 12. 下一位 Agent 的 P0 任务
 
 1. 完成 Mercado Libre OAuth 实测
@@ -597,11 +655,10 @@ IP 隔离：
    - hybrid retrieval
    - 评测集
 
-7. 实现飞书 Webhook 配置与测试
-   - 配置不回显
-   - 测试按钮
-   - 新消息告警
-   - 失败重试
+7. 继续增强飞书 Webhook
+   - 已有配置保存和测试按钮
+   - 已有 webhook 新事件告警
+   - 下一步做失败重试、消息模板业务化、按店铺/成员订阅
 
 ## 13. 重要安全提醒
 

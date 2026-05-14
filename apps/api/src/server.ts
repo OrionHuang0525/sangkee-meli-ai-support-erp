@@ -200,6 +200,96 @@ async function createOperationLog(req: express.Request, input: {
   });
 }
 
+async function getSetting<T = Record<string, unknown>>(shopId: string, key: string): Promise<T | null> {
+  const setting = await prisma.settingsRule.findUnique({ where: { shopId_key: { shopId, key } } });
+  return setting?.active ? setting.value as T : null;
+}
+
+async function upsertSetting(shopId: string, key: string, value: Prisma.InputJsonValue) {
+  return prisma.settingsRule.upsert({
+    where: { shopId_key: { shopId, key } },
+    create: { shopId, key, value, active: true },
+    update: { value, active: true }
+  });
+}
+
+function maskUrl(value: string) {
+  if (!value) return "";
+  try {
+    const url = new URL(value);
+    const parts = url.pathname.split("/").filter(Boolean);
+    const last = parts.pop() || "";
+    const maskedLast = last.length > 8 ? `${last.slice(0, 4)}****${last.slice(-4)}` : "****";
+    url.pathname = `/${[...parts, maskedLast].join("/")}`;
+    return url.toString();
+  } catch {
+    return value.length > 12 ? `${value.slice(0, 6)}****${value.slice(-4)}` : "****";
+  }
+}
+
+type FeishuWebhookConfig = {
+  webhookUrlEnc?: string;
+  secretEnc?: string;
+  enabled?: boolean;
+  notifyPresale?: boolean;
+  notifyAftersale?: boolean;
+};
+
+type AutomationPolicy = {
+  autoReplyMode?: "off" | "low_risk_templates_only" | "all_templates";
+  bulkApproveLowRisk?: boolean;
+  requireHumanForHighRisk?: boolean;
+};
+
+async function getFeishuWebhookConfig(shopId: string) {
+  const config = await getSetting<FeishuWebhookConfig>(shopId, "feishu_webhook");
+  if (!config?.webhookUrlEnc) return null;
+  return {
+    webhookUrl: decryptSecret(config.webhookUrlEnc),
+    secret: config.secretEnc ? decryptSecret(config.secretEnc) : "",
+    enabled: config.enabled !== false,
+    notifyPresale: config.notifyPresale !== false,
+    notifyAftersale: config.notifyAftersale !== false
+  };
+}
+
+function buildFeishuPayload(text: string, secret?: string) {
+  const payload: Record<string, unknown> = {
+    msg_type: "text",
+    content: { text }
+  };
+  if (secret) {
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const sign = crypto.createHmac("sha256", `${timestamp}\n${secret}`).update("").digest("base64");
+    payload.timestamp = timestamp;
+    payload.sign = sign;
+  }
+  return payload;
+}
+
+async function sendFeishuWebhook(shopId: string, text: string) {
+  const config = await getFeishuWebhookConfig(shopId);
+  if (!config?.enabled || !config.webhookUrl) return { skipped: true, reason: "not_configured" };
+
+  const response = await fetch(config.webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(buildFeishuPayload(text, config.secret))
+  });
+  const body = await response.text();
+  if (!response.ok) throw new HttpError(502, `Feishu webhook failed: HTTP ${response.status} ${body.slice(0, 300)}`);
+  return { skipped: false, status: response.status };
+}
+
+async function notifyFeishuSafely(shopId: string, text: string) {
+  try {
+    return await sendFeishuWebhook(shopId, text);
+  } catch (error) {
+    console.warn("[feishu] notify failed", error instanceof Error ? error.message : String(error));
+    return { skipped: true, reason: "send_failed" };
+  }
+}
+
 function parseCsvLine(line: string): string[] {
   const cells: string[] = [];
   let current = "";
@@ -234,6 +324,41 @@ function parseSkuCsv(csv: string): Array<Record<string, string>> {
     const cells = parseCsvLine(line);
     return Object.fromEntries(headers.map((header, index) => [header, cells[index] || ""]));
   });
+}
+
+function decodedTextScore(text: string) {
+  const badPatterns = ["\uFFFD", "锟", "閿", "鍙", "鏂", "涓", "涔", "鑱", "绋", "铆", "贸", "帽", "煤", "Ã", "Â"];
+  let score = 0;
+  for (const pattern of badPatterns) score += (text.match(new RegExp(pattern, "g")) || []).length * 10;
+  score += (text.match(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g) || []).length * 6;
+  if (/sku/i.test(text)) score -= 6;
+  if (/title|商品|标题|名称|factura|garant/i.test(text)) score -= 3;
+  if (text.includes(",") || text.includes("\t") || text.includes(";")) score -= 2;
+  return score;
+}
+
+function decodeCsvPayload(body: unknown) {
+  const input = (body || {}) as Record<string, unknown>;
+  const directCsv = String(input.csv || "");
+  if (directCsv) return directCsv;
+
+  const base64 = normalizeText(input.csvBase64);
+  if (!base64) return "";
+
+  const bytes = Buffer.from(base64, "base64");
+  const requested = normalizeText(input.encoding).toLowerCase();
+  const encodings = requested && requested !== "auto"
+    ? [requested]
+    : ["utf-8", "gb18030", "utf-16le", "big5"];
+  const decoded = encodings.flatMap((encoding) => {
+    try {
+      const text = new TextDecoder(encoding, { fatal: encoding === "utf-8" }).decode(bytes).replace(/^\uFEFF/, "");
+      return [{ text, score: decodedTextScore(text) }];
+    } catch {
+      return [];
+    }
+  });
+  return decoded.sort((a, b) => a.score - b.score)[0]?.text || bytes.toString("utf8");
 }
 
 function pickInput(input: Record<string, unknown>, keys: string[]): unknown {
@@ -309,44 +434,245 @@ async function upsertSkuKnowledge(shopId: string, input: Record<string, unknown>
   });
 }
 
-function kimiConfigured() {
-  return Boolean(optionalEnv("KIMI_API_KEY") || optionalEnv("MOONSHOT_API_KEY"));
+type AiRuntimeConfig = {
+  provider: string;
+  configured: boolean;
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+  stream: boolean;
+  timeoutMs: number;
+  maxTokens: number;
+  temperature: number;
+  topP: number;
+  chatTemplateKwargs?: Record<string, unknown>;
+};
+
+function selectedAiProvider() {
+  return (optionalEnv("AI_PROVIDER") || "local").toLowerCase();
 }
 
-async function callKimiJson<T>(messages: Array<{ role: "system" | "user" | "assistant"; content: string }>, fallback: T): Promise<T> {
-  const apiKey = optionalEnv("KIMI_API_KEY") || optionalEnv("MOONSHOT_API_KEY");
-  if (!apiKey) return fallback;
+function boolEnv(name: string, fallback: boolean) {
+  const raw = optionalEnv(name).toLowerCase();
+  if (!raw) return fallback;
+  return ["1", "true", "yes", "on"].includes(raw);
+}
 
-  const baseUrl = optionalEnv("KIMI_BASE_URL") || "https://api.moonshot.cn/v1";
+function numberEnv(names: string[], fallback: number) {
+  for (const name of names) {
+    const raw = optionalEnv(name);
+    if (!raw) continue;
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return fallback;
+}
+
+function getAiRuntimeConfig(): AiRuntimeConfig {
+  const provider = selectedAiProvider();
+  if (provider === "nvidia") {
+    const model = optionalEnv("NVIDIA_MODEL") || optionalEnv("KIMI_MODEL") || "moonshotai/kimi-k2.6";
+    return {
+      provider,
+      configured: Boolean(optionalEnv("NVIDIA_API_KEY") || optionalEnv("NVAPI_KEY")),
+      apiKey: optionalEnv("NVIDIA_API_KEY") || optionalEnv("NVAPI_KEY"),
+      baseUrl: optionalEnv("NVIDIA_BASE_URL") || "https://integrate.api.nvidia.com/v1",
+      model,
+      stream: boolEnv("NVIDIA_STREAM", false),
+      timeoutMs: numberEnv(["NVIDIA_TIMEOUT_MS", "AI_TIMEOUT_MS"], 60_000),
+      maxTokens: numberEnv(["NVIDIA_MAX_TOKENS", "AI_MAX_TOKENS"], 16_384),
+      temperature: numberEnv(["NVIDIA_TEMPERATURE", "AI_TEMPERATURE"], 1),
+      topP: numberEnv(["NVIDIA_TOP_P", "AI_TOP_P"], 1),
+      chatTemplateKwargs: { thinking: boolEnv("NVIDIA_THINKING", true) }
+    };
+  }
+
   const model = optionalEnv("KIMI_MODEL") || "moonshot-v1-auto";
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), Number(optionalEnv("KIMI_TIMEOUT_MS") || 60_000));
-  const response = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
+  return {
+    provider,
+    configured: Boolean(optionalEnv("KIMI_API_KEY") || optionalEnv("MOONSHOT_API_KEY")),
+    apiKey: optionalEnv("KIMI_API_KEY") || optionalEnv("MOONSHOT_API_KEY"),
+    baseUrl: optionalEnv("KIMI_BASE_URL") || "https://api.moonshot.cn/v1",
+    model,
+    stream: boolEnv("KIMI_STREAM", false),
+    timeoutMs: numberEnv(["KIMI_TIMEOUT_MS", "AI_TIMEOUT_MS"], 60_000),
+    maxTokens: numberEnv(["KIMI_MAX_TOKENS", "AI_MAX_TOKENS"], 4096),
+    temperature: numberEnv(["KIMI_TEMPERATURE", "AI_TEMPERATURE"], model.startsWith("kimi-k") ? 1 : 0.2),
+    topP: numberEnv(["KIMI_TOP_P", "AI_TOP_P"], 1)
+  };
+}
+
+function aiConfigured() {
+  const config = getAiRuntimeConfig();
+  return config.provider !== "local" && config.configured;
+}
+
+function kimiConfigured() {
+  return aiConfigured();
+}
+
+function aiGenerationEnabled() {
+  return ["kimi", "moonshot", "nvidia"].includes(selectedAiProvider()) && aiConfigured();
+}
+
+function aiPromptVersion(flow: "presale" | "aftersale") {
+  if (!aiGenerationEnabled()) return flow === "presale" ? "presale-v2-local-rag" : "aftersale-v2-local-template";
+  return flow === "presale" ? `presale-v2-${selectedAiProvider()}-rag` : `aftersale-v2-${selectedAiProvider()}-template`;
+}
+
+async function readStreamingChatContent(response: Response): Promise<string> {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let content = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) continue;
+      const data = trimmed.slice(5).trim();
+      if (!data || data === "[DONE]") continue;
+      try {
+        const parsed = JSON.parse(data) as {
+          choices?: Array<{
+            delta?: { content?: string };
+            message?: { content?: string };
+          }>;
+        };
+        content += parsed.choices?.map((choice) => choice.delta?.content || choice.message?.content || "").join("") || "";
+      } catch {
+        content += data;
+      }
+    }
+  }
+
+  return content;
+}
+
+async function callAiJson<T>(messages: Array<{ role: "system" | "user" | "assistant"; content: string }>, fallback: T): Promise<T> {
+  const config = getAiRuntimeConfig();
+  if (!config.configured || config.provider === "local") return fallback;
+
+  const response = await fetch(`${config.baseUrl.replace(/\/$/, "")}/chat/completions`, {
     method: "POST",
-    signal: controller.signal,
     headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json"
+      Authorization: `Bearer ${config.apiKey}`,
+      "Content-Type": "application/json",
+      Accept: config.stream ? "text/event-stream" : "application/json"
     },
     body: JSON.stringify({
-      model,
+      model: config.model,
       messages: [
         ...messages,
         { role: "user", content: "Return only valid JSON. Do not wrap it in markdown." }
       ],
-      temperature: model.startsWith("kimi-k") ? 1 : 0.2
+      max_tokens: config.maxTokens,
+      temperature: config.temperature,
+      top_p: config.topP,
+      stream: config.stream,
+      ...(config.chatTemplateKwargs ? { chat_template_kwargs: config.chatTemplateKwargs } : {})
     })
-  }).finally(() => clearTimeout(timeout));
+  });
 
   if (!response.ok) {
-    throw new HttpError(502, `Kimi API failed: HTTP ${response.status} ${await response.text()}`);
+    const body = await response.text();
+    throw new HttpError(502, `${config.provider} API failed: HTTP ${response.status} ${body}`);
   }
 
-  const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-  const content = data.choices?.[0]?.message?.content || "";
+  const content = config.stream
+    ? await readStreamingChatContent(response)
+    : ((await response.json()) as { choices?: Array<{ message?: { content?: string } }> }).choices?.[0]?.message?.content || "";
   const jsonMatch = content.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) throw new HttpError(502, "Kimi API did not return JSON");
+  if (!jsonMatch) throw new HttpError(502, `${config.provider} API did not return JSON`);
   return JSON.parse(jsonMatch[0]) as T;
+}
+
+async function streamAiText(
+  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
+  onChunk: (chunk: string) => void
+) {
+  const config = getAiRuntimeConfig();
+  if (!config.configured || config.provider === "local") return "";
+
+  const response = await fetch(`${config.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${config.apiKey}`,
+      "Content-Type": "application/json",
+      Accept: "text/event-stream"
+    },
+    body: JSON.stringify({
+      model: config.model,
+      messages,
+      max_tokens: Math.min(config.maxTokens, 1200),
+      temperature: config.temperature,
+      top_p: config.topP,
+      stream: true,
+      ...(config.chatTemplateKwargs ? { chat_template_kwargs: config.chatTemplateKwargs } : {})
+    })
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new HttpError(502, `${config.provider} API failed: HTTP ${response.status} ${body}`);
+  }
+
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let content = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) continue;
+      const data = trimmed.slice(5).trim();
+      if (!data || data === "[DONE]") continue;
+      try {
+        const parsed = JSON.parse(data) as {
+          choices?: Array<{
+            delta?: { content?: string };
+            message?: { content?: string };
+          }>;
+        };
+        const chunk = parsed.choices?.map((choice) => choice.delta?.content || choice.message?.content || "").join("") || "";
+        if (chunk) {
+          content += chunk;
+          onChunk(chunk);
+        }
+      } catch {
+        content += data;
+        onChunk(data);
+      }
+    }
+  }
+
+  return content.trim();
+}
+
+function streamPresaleSystemPrompt() {
+  return [
+    "Eres un asistente de atención preventa para Mercado Libre México.",
+    "Responde en español mexicano natural, breve y útil.",
+    "Usa únicamente la información del producto, SKU, políticas y base de conocimiento proporcionadas.",
+    "No compartas WhatsApp, teléfono, correo, direcciones, enlaces externos ni invites a pagar fuera de Mercado Libre.",
+    "No prometas fechas exactas, descuentos, reembolsos ni garantías no documentadas.",
+    "Devuelve solamente el texto final que verá el comprador. No devuelvas JSON, markdown ni explicación interna."
+  ].join("\n");
 }
 
 function fallbackChunkPlan(title: string, docType: string, content: string, sku?: string) {
@@ -370,7 +696,7 @@ async function agenticChunkDocument(input: { title: string; docType: string; con
   if (!kimiConfigured() || input.content.length < 80) return fallback;
 
   try {
-    const result = await callKimiJson([
+    const result = await callAiJson([
       {
         role: "system",
         content: [
@@ -464,7 +790,7 @@ const DEFAULT_REPLY_TEMPLATES = [
     keywords: ["no recibí", "no llego", "no ha llegado", "paquete"],
     content: "Hola, lamentamos lo ocurrido. Te recomendamos revisar el estado del envío desde Mercado Libre. Si el paquete sigue sin actualizarse, por favor continúa el seguimiento desde el flujo oficial de la plataforma.",
     variables: ["orderId", "trackingStatus"],
-    requiresReview: true
+    requiresReview: false
   },
   {
     name: "物流延迟",
@@ -473,7 +799,7 @@ const DEFAULT_REPLY_TEMPLATES = [
     keywords: ["demora", "tarde", "retraso", "entrega"],
     content: "Hola, sentimos la demora. El envío es gestionado por Mercado Libre y puedes revisar la fecha estimada desde el detalle de tu compra. Seguiremos atentos por este medio.",
     variables: ["estimatedDeliveryDate"],
-    requiresReview: true
+    requiresReview: false
   },
   {
     name: "发票问题",
@@ -482,7 +808,16 @@ const DEFAULT_REPLY_TEMPLATES = [
     keywords: ["factura", "facturar", "cfdi", "rfc"],
     content: "Hola, gracias por la información. Vamos a revisar los datos de facturación y, si falta algún dato adicional, te contactaremos por este medio.",
     variables: ["orderId"],
-    requiresReview: true
+    requiresReview: false
+  },
+  {
+    name: "转人工安抚",
+    intentCode: "human_request",
+    category: "human_request",
+    keywords: ["humano", "persona", "asesor", "agente", "ejecutivo", "representante", "atención humana", "atencion humana", "supervisor"],
+    content: "Hola, claro. Ya notificamos a nuestro equipo de atención y una persona revisará tu caso lo antes posible por este mismo chat de Mercado Libre.",
+    variables: ["packId", "orderId"],
+    requiresReview: false
   },
   {
     name: "商品损坏",
@@ -491,7 +826,7 @@ const DEFAULT_REPLY_TEMPLATES = [
     keywords: ["dañado", "roto", "quebrado", "defecto"],
     content: "Hola, lamentamos el inconveniente. Para poder revisar el caso, por favor comparte fotos o evidencia del estado del producto dentro del chat de Mercado Libre.",
     variables: ["itemTitle", "sku"],
-    requiresReview: true
+    requiresReview: false
   },
   {
     name: "退货流程",
@@ -500,7 +835,7 @@ const DEFAULT_REPLY_TEMPLATES = [
     keywords: ["devolver", "devolución", "regresar", "cambio"],
     content: "Hola, para una devolución o cambio es necesario seguir el flujo oficial de Mercado Libre desde el detalle de la compra. Revisaremos la información disponible y te apoyaremos por este medio.",
     variables: ["orderId"],
-    requiresReview: true
+    requiresReview: false
   },
   {
     name: "退款问题",
@@ -509,7 +844,7 @@ const DEFAULT_REPLY_TEMPLATES = [
     keywords: ["reembolso", "dinero", "refund", "pago"],
     content: "Hola, entendemos tu solicitud. Cualquier reembolso debe revisarse y procesarse mediante el flujo oficial de Mercado Libre según el estado del pedido.",
     variables: ["orderId"],
-    requiresReview: true
+    requiresReview: false
   }
 ];
 
@@ -530,7 +865,12 @@ async function ensureDefaultReplyTemplates(shopId: string) {
         variables: template.variables,
         requiresReview: template.requiresReview
       },
-      update: {}
+      update: {
+        category: template.category,
+        keywords: template.keywords,
+        variables: template.variables,
+        requiresReview: template.requiresReview
+      }
     });
     created.push(record);
   }
@@ -585,10 +925,10 @@ async function generatePresaleWithAi(input: {
   ragHits: KnowledgeHit[];
 }): Promise<PresaleReply> {
   const fallback = generateLocalPresaleDraft(input);
-  if ((optionalEnv("AI_PROVIDER") || "local") !== "kimi" || !kimiConfigured()) return fallback;
+  if (!aiGenerationEnabled()) return fallback;
 
   try {
-    const raw = await callKimiJson([
+    const raw = await callAiJson([
       { role: "system", content: presaleSystemPrompt },
       { role: "user", content: JSON.stringify(input) }
     ], fallback);
@@ -606,6 +946,60 @@ async function generatePresaleWithAi(input: {
   }
 }
 
+async function buildPresaleGenerationContext(shopId: string, question: {
+  shopId: string;
+  itemId: string;
+  questionText?: string | null;
+  rawItem?: Prisma.JsonValue | null;
+}) {
+  const sku = await findSkuKnowledgeForQuestion(question);
+  const rawItem = (question.rawItem || {}) as Record<string, unknown>;
+  const query = `${question.questionText || ""} ${rawItem.title || ""} ${sku?.sku || ""}`;
+  const ragHits = await retrieveKnowledge(shopId, query, { sku: sku?.sku || normalizeText(rawItem.sku), limit: 6 });
+  const input = {
+    questionText: question.questionText || "",
+    itemTitle: normalizeText(rawItem.title),
+    sku: sku?.sku,
+    knowledge: skuToKnowledge(sku),
+    ragHits
+  };
+  return { sku, rawItem, ragHits, input };
+}
+
+async function savePresaleDraft(shopId: string, question: { id: string }, draft: PresaleReply, inputSnapshot: unknown) {
+  const updated = await prisma.presaleQuestion.update({
+    where: { id: question.id },
+    data: { aiDraft: draft.answer_es_mx, aiConfidence: draft.confidence, riskLevel: draft.risk_level, reviewStatus: draft.needs_human_review ? "needs_human" : "draft_ready" }
+  });
+  await prisma.aiSuggestion.create({
+    data: {
+      shopId,
+      targetType: "presale_question",
+      targetId: question.id,
+      model: selectedAiProvider() || "local_rules",
+      promptVersion: aiPromptVersion("presale"),
+      inputSnapshot: safeJson(inputSnapshot) as unknown as Prisma.InputJsonValue,
+      outputJson: safeJson(draft) as unknown as Prisma.InputJsonValue,
+      outputText: draft.answer_es_mx,
+      riskFlags: draft.policy_flags
+    }
+  });
+  return updated;
+}
+
+function buildStreamingPresaleDraft(answer: string, fallback: PresaleReply): PresaleReply {
+  const text = normalizeText(answer) || fallback.answer_es_mx;
+  const safety = assertSafePresaleAnswer(text);
+  return PresaleReplySchema.parse({
+    answer_es_mx: text.slice(0, 2000),
+    confidence: safety.safe ? Math.max(fallback.confidence, 0.78) : 0.35,
+    risk_level: safety.safe ? fallback.risk_level : "high",
+    needs_human_review: fallback.needs_human_review || !safety.safe,
+    missing_info: fallback.missing_info,
+    policy_flags: [...new Set([...fallback.policy_flags, ...safety.flags])]
+  });
+}
+
 async function generateAftersaleWithAi(input: {
   latestMessage: string;
   orderStatus?: string;
@@ -617,10 +1011,10 @@ async function generateAftersaleWithAi(input: {
   ragHits: KnowledgeHit[];
 }): Promise<AftersaleAnalysis> {
   const fallback = generateLocalAftersaleAnalysis(input);
-  if ((optionalEnv("AI_PROVIDER") || "local") !== "kimi" || !kimiConfigured()) return fallback;
+  if (!aiGenerationEnabled()) return fallback;
 
   try {
-    const raw = await callKimiJson([
+    const raw = await callAiJson([
       { role: "system", content: aftersaleSystemPrompt },
       { role: "user", content: JSON.stringify(input) }
     ], fallback);
@@ -728,8 +1122,65 @@ async function fetchMeliMe(accessToken: string) {
   return response.json() as Promise<{ id: number; nickname?: string; site_id?: string }>;
 }
 
+async function getFreshMeliAccessToken(shopId: string) {
+  const current = await prisma.meliToken.findFirst({ where: { shopId }, orderBy: { createdAt: "desc" } });
+  if (!current) throw new HttpError(409, "Mercado Libre shop is not authorized yet");
+  if (current.expiresAt.getTime() > Date.now() + 60_000) return decryptSecret(current.accessTokenEnc);
+
+  const refreshed = await refreshMeliToken(decryptSecret(current.refreshTokenEnc));
+  const expiresAt = new Date(Date.now() + refreshed.expires_in * 1000);
+  const token = await prisma.meliToken.create({
+    data: {
+      shopId,
+      accessTokenEnc: encryptSecret(refreshed.access_token),
+      refreshTokenEnc: encryptSecret(refreshed.refresh_token),
+      scope: refreshed.scope,
+      expiresAt,
+      lastRefreshAt: new Date()
+    }
+  });
+  await prisma.meliToken.update({ where: { id: current.id }, data: { refreshError: null } }).catch(() => undefined);
+  await prisma.apiCallLog.create({ data: { shopId, method: "POST", path: "/oauth/token", statusCode: 200, latencyMs: 0 } }).catch(() => undefined);
+  return decryptSecret(token.accessTokenEnc);
+}
+
+async function postMeliAnswer(shopId: string, questionId: bigint, text: string) {
+  const accessToken = await getFreshMeliAccessToken(shopId);
+  const path = "/answers";
+  const startedAt = Date.now();
+  let statusCode: number | undefined;
+  let errorText = "";
+
+  try {
+    const response = await fetch(`https://api.mercadolibre.com${path}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/json",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ question_id: questionId.toString(), text })
+    });
+    statusCode = response.status;
+    const body = await response.text();
+    if (!response.ok) {
+      errorText = body.slice(0, 1000);
+      throw new HttpError(502, `Mercado Libre answer failed: HTTP ${response.status} ${errorText}`);
+    }
+    return body ? JSON.parse(body) as unknown : {};
+  } catch (error) {
+    errorText = errorText || (error instanceof Error ? error.message : String(error));
+    throw error;
+  } finally {
+    await prisma.apiCallLog.create({
+      data: { shopId, method: "POST", path, statusCode, latencyMs: Date.now() - startedAt, error: errorText || undefined }
+    }).catch(() => undefined);
+  }
+}
+
 app.get("/health", async (req, res) => {
   const shopId = await resolveShopId(req).catch(() => null);
+  const ai = getAiRuntimeConfig();
   const [shopCount, pendingWebhookCount, skuCount, chunkCount, presalePending, aftersaleOpen] = await Promise.all([
     prisma.shop.count().catch(() => -1),
     prisma.webhookEvent.count({ where: { status: "pending" } }).catch(() => -1),
@@ -750,10 +1201,12 @@ app.get("/health", async (req, res) => {
     presalePending,
     aftersaleOpen,
     ai: {
-      provider: optionalEnv("AI_PROVIDER") || "local",
+      provider: ai.provider,
+      configured: ai.configured,
       kimiConfigured: kimiConfigured(),
-      model: optionalEnv("KIMI_MODEL") || "moonshot-v1-auto",
-      baseUrl: optionalEnv("KIMI_BASE_URL") || "https://api.moonshot.cn/v1"
+      model: ai.model,
+      baseUrl: ai.baseUrl,
+      stream: ai.stream
     }
   });
 });
@@ -883,6 +1336,25 @@ app.post("/webhooks/meli", async (req, res, next) => {
       removeOnFail: false
     });
 
+    const sellerIdForNotification = toBigIntOrNull(payload.user_id);
+    if (sellerIdForNotification && (payload.topic === "questions" || payload.topic === "messages" || payload.topic === "claims")) {
+      const shop = await prisma.shop.findUnique({ where: { sellerId: sellerIdForNotification } }).catch(() => null);
+      if (shop) {
+        const config = await getFeishuWebhookConfig(shop.id).catch(() => null);
+        const isPresale = payload.topic === "questions";
+        const shouldNotify = isPresale && config?.notifyPresale !== false;
+        if (config?.enabled && shouldNotify) {
+          void notifyFeishuSafely(shop.id, [
+            "[Mercado Libre] New platform event",
+            `Store: ${shop.nickname || shop.sellerId.toString()}`,
+            `Topic: ${payload.topic}`,
+            `Resource: ${payload.resource}`,
+            "Status: queued for processing"
+          ].join("\n"));
+        }
+      }
+    }
+
     return sendJson(res, { success: true, eventId: event.id });
   } catch (error) {
     return next(error);
@@ -921,7 +1393,7 @@ app.get("/dashboard", async (req, res, next) => {
       prisma.meliToken.count({ where: { shopId } })
     ]);
 
-    const pendingReviews = presaleReady + aftersaleOpen;
+    const pendingReviews = presaleReady;
     const adoptionRate = aiCount ? Math.round((acceptedCount / aiCount) * 100) : 0;
     return sendJson(res, {
       success: true,
@@ -1018,30 +1490,365 @@ app.post("/demo/seed", async (req, res, next) => {
 
     const templates = await ensureDefaultReplyTemplates(shop.id);
     await createOperationLog(req, { shopId: shop.id, action: "demo.seed", targetType: "shop", targetId: shop.id, detail: { questionId: question.id, threadId: thread.id, templates: templates.length } });
+    await notifyFeishuSafely(shop.id, [
+      "[Demo] New support workspace data",
+      `Store: ${shop.nickname || shop.sellerId.toString()}`,
+      `Presale question: ${question.questionText || "-"}`,
+      `Aftersale pack: ${thread.packId.toString()}`,
+      "You can now test draft generation and review flows."
+    ].join("\n"));
     return sendJson(res, { success: true, shop, sku, question, thread, templates });
   } catch (error) {
     return next(error);
   }
 });
 
+function nextDemoBigInt(offset = 0) {
+  return BigInt(Date.now()) * 1000n + BigInt(Math.floor(Math.random() * 900) + offset);
+}
+
+async function createDemoPresaleQuestion(shopId: string, input: {
+  sku: string;
+  itemId: string;
+  itemTitle: string;
+  questionText: string;
+  buyerId?: bigint;
+}) {
+  const questionId = nextDemoBigInt(100);
+  return prisma.presaleQuestion.create({
+    data: {
+      shopId,
+      questionId,
+      itemId: input.itemId,
+      buyerId: input.buyerId || nextDemoBigInt(200),
+      questionText: input.questionText,
+      questionStatus: "UNANSWERED",
+      reviewStatus: "pending",
+      riskLevel: "low",
+      rawQuestion: safeJson({
+        id: questionId.toString(),
+        text: input.questionText,
+        status: "UNANSWERED",
+        source: "demo_qa"
+      }) as Prisma.InputJsonValue,
+      rawItem: safeJson({
+        id: input.itemId,
+        sku: input.sku,
+        title: input.itemTitle,
+        source: "demo_qa"
+      }) as Prisma.InputJsonValue
+    }
+  });
+}
+
+async function createDemoAftersaleThread(shopId: string, input: {
+  sku: string;
+  orderStatus: string;
+  shipmentStatus: string;
+  latestMessage: string;
+  orderId?: bigint;
+  packId?: bigint;
+  buyerId?: bigint;
+}) {
+  const packId = input.packId || nextDemoBigInt(300);
+  const orderId = input.orderId || nextDemoBigInt(400);
+  const messageId = `demo-qa-message-${packId.toString()}-${Date.now()}`;
+  const thread = await prisma.aftersaleThread.create({
+    data: {
+      shopId,
+      packId,
+      orderId,
+      buyerId: input.buyerId || nextDemoBigInt(500),
+      status: "open",
+      riskLevel: "medium",
+      lastMessageAt: new Date(),
+      rawContext: safeJson({
+        sku: input.sku,
+        orderStatus: input.orderStatus,
+        shipmentStatus: input.shipmentStatus,
+        latestMessage: input.latestMessage,
+        source: "demo_qa"
+      }) as Prisma.InputJsonValue
+    }
+  });
+
+  await prisma.message.create({
+    data: {
+      shopId,
+      threadId: thread.id,
+      meliMessageId: messageId,
+      packId,
+      direction: "inbound",
+      text: input.latestMessage,
+      rawMessage: safeJson({ source: "demo_qa", sku: input.sku }) as Prisma.InputJsonValue,
+      messageDate: new Date()
+    }
+  });
+
+  return prisma.aftersaleThread.findUnique({
+    where: { id: thread.id },
+    include: { messages: { orderBy: { messageDate: "asc" }, take: 10 } }
+  });
+}
+
+app.post("/demo/qa/seed", async (req, res, next) => {
+  try {
+    const actor = await getActor(req);
+    const shop = await getOrCreateDemoShop(actor.id);
+    const skus = [];
+
+    for (const item of [
+      {
+        sku: "QA-KB-USB-C-65W",
+        itemId: "MLM-QA-USB-C-65W",
+        title: "Cargador USB-C 65W con cable tipo C",
+        brand: "QA Brand",
+        category: "Cargadores",
+        sellingPoints: "Carga rápida de 65W para laptops compatibles, celulares y tablets USB-C.",
+        faq: "Compatible con equipos USB-C Power Delivery. No incluye adaptador para iPhone Lightning.",
+        warrantyPolicy: "Garantía de 30 días por defectos de fabricación.",
+        invoicePolicy: "Sí facturamos después de la compra con RFC, razón social, uso de CFDI y forma de pago por chat de Mercado Libre.",
+        shippingNotes: "El envío y la fecha estimada dependen de Mercado Libre.",
+        returnPolicy: "Para cambios o devoluciones se debe seguir el flujo oficial de Mercado Libre."
+      },
+      {
+        sku: "QA-KB-HEADSET-RGB",
+        itemId: "MLM-QA-HEADSET-RGB",
+        title: "Audífonos gamer RGB con micrófono",
+        brand: "QA Brand",
+        category: "Audio",
+        sellingPoints: "Audífonos alámbricos con micrófono ajustable, luz RGB y conexión USB.",
+        faq: "Funciona en PC y laptop con puerto USB. No es Bluetooth.",
+        warrantyPolicy: "Garantía por defectos de fabricación, no cubre daño por líquido o mal uso.",
+        invoicePolicy: "La factura se solicita después de la compra dentro del chat de Mercado Libre.",
+        shippingNotes: "Mercado Libre gestiona la entrega.",
+        returnPolicy: "Si llega dañado, pedir evidencia y continuar por el flujo oficial."
+      }
+    ]) {
+      skus.push(await upsertSkuKnowledge(shop.id, item));
+    }
+
+    const docs = [];
+    for (const doc of [
+      {
+        title: "QA política de factura para preventa",
+        docType: "invoice",
+        sku: "QA-KB-USB-C-65W",
+        content: "Para el cargador QA-KB-USB-C-65W sí se puede emitir factura. El comprador debe compartir RFC, razón social, régimen fiscal, uso de CFDI y forma de pago después de comprar. No pedir datos fuera de Mercado Libre."
+      },
+      {
+        title: "QA compatibilidad audífonos gamer",
+        docType: "faq",
+        sku: "QA-KB-HEADSET-RGB",
+        content: "Los audífonos QA-KB-HEADSET-RGB son alámbricos USB. Funcionan en PC y laptop con puerto USB. No son Bluetooth y no se recomienda prometer compatibilidad con consolas sin validar el modelo."
+      }
+    ]) {
+      const plan = await agenticChunkDocument(doc);
+      const created = await prisma.$transaction(async (tx) => {
+        const document = await tx.kbDocument.create({ data: { shopId: shop.id, title: doc.title, docType: doc.docType, content: doc.content, locale: "es-MX", status: "indexed" } });
+        await tx.kbChunk.createMany({
+          data: plan.chunks.map((chunk) => ({
+            documentId: document.id,
+            shopId: shop.id,
+            content: chunk.content,
+            metadata: safeJson({ title: chunk.title, doc_type: chunk.doc_type, sku_tags: chunk.sku_tags, intent_tags: chunk.intent_tags, risk_tags: chunk.risk_tags, source_title: doc.title }) as Prisma.InputJsonValue,
+            scoreHint: chunk.priority
+          }))
+        });
+        return document;
+      });
+      docs.push(created);
+    }
+
+    const presale = await createDemoPresaleQuestion(shop.id, {
+      sku: "QA-KB-USB-C-65W",
+      itemId: "MLM-QA-USB-C-65W",
+      itemTitle: "Cargador USB-C 65W con cable tipo C",
+      questionText: "Hola, ¿sirve para laptop con USB-C y me pueden facturar?"
+    });
+    const aftersale = await createDemoAftersaleThread(shop.id, {
+      sku: "QA-KB-HEADSET-RGB",
+      orderStatus: "paid",
+      shipmentStatus: "delivered",
+      latestMessage: "Hola, mis audífonos llegaron pero el micrófono no funciona. ¿Me pueden ayudar?",
+      orderId: BigInt(Date.now() + 7000),
+      packId: BigInt(Date.now() + 8000)
+    });
+    if (!aftersale) throw new HttpError(500, "Failed to create aftersale thread");
+
+    await ensureDefaultReplyTemplates(shop.id);
+    await createOperationLog(req, { shopId: shop.id, action: "demo.qa.seed", targetType: "shop", targetId: shop.id, detail: { skus: skus.length, docs: docs.length, presale: presale.id, aftersale: aftersale.id } });
+    return sendJson(res, { success: true, shop, skus, docs, presale, aftersale });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.post("/demo/qa/presale", async (req, res, next) => {
+  try {
+    const actor = await getActor(req);
+    const shopId = String(req.body?.shopId || "");
+    const shop = shopId
+      ? await prisma.shop.findFirst({ where: { id: shopId } })
+      : await getOrCreateDemoShop(actor.id);
+    if (!shop) throw new HttpError(404, "Shop not found");
+    const question = await createDemoPresaleQuestion(shop.id, {
+      sku: String(req.body?.sku || "QA-KB-USB-C-65W"),
+      itemId: String(req.body?.itemId || "MLM-QA-USB-C-65W"),
+      itemTitle: String(req.body?.itemTitle || "Cargador USB-C 65W con cable tipo C"),
+      questionText: String(req.body?.questionText || "Hola, sirve para laptop con USB-C y me pueden facturar?")
+    });
+    await createOperationLog(req, { shopId: shop.id, action: "demo.qa.presale", targetType: "presale_question", targetId: question.id, detail: { source: "frontend_qa" } });
+    return sendJson(res, { success: true, shop, question });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.post("/demo/qa/aftersale", async (req, res, next) => {
+  try {
+    const actor = await getActor(req);
+    const shopId = String(req.body?.shopId || "");
+    const shop = shopId
+      ? await prisma.shop.findFirst({ where: { id: shopId } })
+      : await getOrCreateDemoShop(actor.id);
+    if (!shop) throw new HttpError(404, "Shop not found");
+    const thread = await createDemoAftersaleThread(shop.id, {
+      sku: String(req.body?.sku || "QA-KB-HEADSET-RGB"),
+      orderStatus: String(req.body?.orderStatus || "paid"),
+      shipmentStatus: String(req.body?.shipmentStatus || "delivered"),
+      latestMessage: String(req.body?.latestMessage || "Hola, mis audifonos llegaron pero el microfono no funciona. Me pueden ayudar?")
+    });
+    if (!thread) throw new HttpError(500, "Failed to create aftersale thread");
+    await createOperationLog(req, { shopId: shop.id, action: "demo.qa.aftersale", targetType: "aftersale_thread", targetId: thread.id, detail: { source: "frontend_qa" } });
+    return sendJson(res, { success: true, shop, thread });
+  } catch (error) {
+    return next(error);
+  }
+});
+
 app.get("/settings/ai", (_req, res) => {
+  const ai = getAiRuntimeConfig();
   sendJson(res, {
     success: true,
-    provider: optionalEnv("AI_PROVIDER") || "local",
+    provider: ai.provider,
+    configured: ai.configured,
     kimiConfigured: kimiConfigured(),
-    model: optionalEnv("KIMI_MODEL") || "moonshot-v1-auto",
-    baseUrl: optionalEnv("KIMI_BASE_URL") || "https://api.moonshot.cn/v1",
+    model: ai.model,
+    baseUrl: ai.baseUrl,
+    stream: ai.stream,
     note: "Model API keys are read only from backend environment variables and are never exposed to the browser."
   });
 });
 
 app.post("/ai/test", async (_req, res, next) => {
   try {
-    const result = await callKimiJson([
+    const result = await callAiJson([
       { role: "system", content: "You are a JSON-only health checker." },
-      { role: "user", content: "Return {\"ok\":true,\"message\":\"kimi connected\"}." }
-    ], { ok: false, message: "kimi not configured" });
+      { role: "user", content: "Return {\"ok\":true,\"message\":\"model connected\"}." }
+    ], { ok: false, message: "model not configured" });
     return sendJson(res, { success: true, result });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.get("/settings/feishu-webhook", async (req, res, next) => {
+  try {
+    const shopId = await resolveShopId(req);
+    const raw = await getSetting<FeishuWebhookConfig>(shopId, "feishu_webhook");
+    const webhookUrl = raw?.webhookUrlEnc ? decryptSecret(raw.webhookUrlEnc) : "";
+    return sendJson(res, {
+      success: true,
+      configured: Boolean(webhookUrl),
+      webhookUrlMasked: maskUrl(webhookUrl),
+      secretConfigured: Boolean(raw?.secretEnc),
+      enabled: raw?.enabled !== false && Boolean(webhookUrl),
+      notifyPresale: raw?.notifyPresale !== false,
+      notifyAftersale: raw?.notifyAftersale !== false
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.post("/settings/feishu-webhook", async (req, res, next) => {
+  try {
+    const shopId = await resolveShopId(req, req.body?.shopId);
+    const webhookUrl = normalizeText(req.body?.webhookUrl);
+    const secret = normalizeText(req.body?.secret);
+    const current = await getSetting<FeishuWebhookConfig>(shopId, "feishu_webhook");
+    if (!webhookUrl && !current?.webhookUrlEnc) throw new HttpError(400, "webhookUrl is required");
+
+    const value: FeishuWebhookConfig = {
+      webhookUrlEnc: webhookUrl ? encryptSecret(webhookUrl) : current?.webhookUrlEnc,
+      secretEnc: secret ? encryptSecret(secret) : current?.secretEnc,
+      enabled: req.body?.enabled === undefined ? true : Boolean(req.body.enabled),
+      notifyPresale: req.body?.notifyPresale === undefined ? true : Boolean(req.body.notifyPresale),
+      notifyAftersale: req.body?.notifyAftersale === undefined ? true : Boolean(req.body.notifyAftersale)
+    };
+    await upsertSetting(shopId, "feishu_webhook", value as Prisma.InputJsonValue);
+    await createOperationLog(req, { shopId, action: "settings.feishu_webhook.save", targetType: "settings_rule", detail: { configured: true, enabled: value.enabled } });
+    return sendJson(res, {
+      success: true,
+      configured: true,
+      webhookUrlMasked: maskUrl(webhookUrl || (current?.webhookUrlEnc ? decryptSecret(current.webhookUrlEnc) : "")),
+      secretConfigured: Boolean(value.secretEnc),
+      enabled: value.enabled,
+      notifyPresale: value.notifyPresale,
+      notifyAftersale: value.notifyAftersale
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.post("/settings/feishu-webhook/test", async (req, res, next) => {
+  try {
+    const shopId = await resolveShopId(req, req.body?.shopId);
+    const shop = await prisma.shop.findUnique({ where: { id: shopId } });
+    const result = await sendFeishuWebhook(shopId, [
+      "[Meli AI Support] Test notification",
+      `Store: ${shop?.nickname || shop?.sellerId?.toString() || shopId}`,
+      "Status: Feishu webhook is connected."
+    ].join("\n"));
+    await createOperationLog(req, { shopId, action: "settings.feishu_webhook.test", targetType: "settings_rule", detail: result });
+    return sendJson(res, { success: true, result });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.get("/settings/automation", async (req, res, next) => {
+  try {
+    const shopId = await resolveShopId(req);
+    const policy = await getSetting<AutomationPolicy>(shopId, "automation_policy");
+    return sendJson(res, {
+      success: true,
+      policy: {
+        autoReplyMode: policy?.autoReplyMode || "all_templates",
+        bulkApproveLowRisk: policy?.bulkApproveLowRisk !== false,
+        requireHumanForHighRisk: Boolean(policy?.requireHumanForHighRisk)
+      }
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.post("/settings/automation", async (req, res, next) => {
+  try {
+    const shopId = await resolveShopId(req, req.body?.shopId);
+    const mode = normalizeText(req.body?.autoReplyMode) as AutomationPolicy["autoReplyMode"];
+    const allowed = new Set(["off", "low_risk_templates_only", "all_templates"]);
+    const policy: AutomationPolicy = {
+      autoReplyMode: allowed.has(mode || "") ? mode : "all_templates",
+      bulkApproveLowRisk: req.body?.bulkApproveLowRisk === undefined ? true : Boolean(req.body.bulkApproveLowRisk),
+      requireHumanForHighRisk: req.body?.requireHumanForHighRisk === undefined ? false : Boolean(req.body.requireHumanForHighRisk)
+    };
+    await upsertSetting(shopId, "automation_policy", policy as Prisma.InputJsonValue);
+    await createOperationLog(req, { shopId, action: "settings.automation.save", targetType: "settings_rule", detail: policy });
+    return sendJson(res, { success: true, policy });
   } catch (error) {
     return next(error);
   }
@@ -1116,6 +1923,50 @@ app.post("/reply-templates/:id/toggle", async (req, res, next) => {
   }
 });
 
+app.patch("/reply-templates/:id", async (req, res, next) => {
+  try {
+    const shopId = await resolveShopId(req, req.body?.shopId);
+    const template = await prisma.replyTemplate.findFirst({ where: { id: String(req.params.id), shopId } });
+    if (!template) throw new HttpError(404, "reply template not found");
+    const content = String(req.body?.content ?? template.content);
+    const updated = await prisma.replyTemplate.update({
+      where: { id: template.id },
+      data: {
+        name: normalizeText(req.body?.name) || template.name,
+        intentCode: normalizeText(req.body?.intentCode) || template.intentCode,
+        category: normalizeText(req.body?.category) || normalizeText(req.body?.intentCode) || template.category,
+        language: normalizeText(req.body?.language) || template.language,
+        scenario: req.body?.scenario === undefined ? template.scenario : normalizeText(req.body?.scenario),
+        keywords: Array.isArray(req.body?.keywords) ? req.body.keywords.map((keyword: unknown) => normalizeText(keyword)).filter(Boolean) : template.keywords,
+        content,
+        variables: Array.isArray(req.body?.variables) ? req.body.variables.map((item: unknown) => normalizeText(item)).filter(Boolean) : template.variables,
+        active: req.body?.active === undefined ? template.active : Boolean(req.body.active),
+        version: content !== template.content ? template.version + 1 : template.version
+      }
+    });
+    if (content !== template.content) {
+      await prisma.replyTemplateVersion.create({ data: { templateId: template.id, version: updated.version, content, changedBy: (await getActor(req)).id, note: normalizeText(req.body?.note) || "frontend edit" } });
+    }
+    await createOperationLog(req, { shopId, action: "reply_template.update", targetType: "reply_template", targetId: template.id });
+    return sendJson(res, { success: true, template: updated });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.delete("/reply-templates/:id", async (req, res, next) => {
+  try {
+    const shopId = await resolveShopId(req, req.body?.shopId || req.query.shopId);
+    const template = await prisma.replyTemplate.findFirst({ where: { id: String(req.params.id), shopId } });
+    if (!template) throw new HttpError(404, "reply template not found");
+    await prisma.replyTemplate.delete({ where: { id: template.id } });
+    await createOperationLog(req, { shopId, action: "reply_template.delete", targetType: "reply_template", targetId: template.id, detail: { name: template.name } });
+    return sendJson(res, { success: true, deletedId: template.id });
+  } catch (error) {
+    return next(error);
+  }
+});
+
 app.get("/kb/skus", async (req, res, next) => {
   try {
     const shopId = await resolveShopId(req);
@@ -1137,7 +1988,7 @@ app.get("/kb/skus", async (req, res, next) => {
 app.post("/kb/skus/import", async (req, res, next) => {
   try {
     const shopId = await resolveShopId(req, req.body?.shopId);
-    const rows = Array.isArray(req.body?.items) ? req.body.items : parseSkuCsv(String(req.body?.csv || ""));
+    const rows = Array.isArray(req.body?.items) ? req.body.items : parseSkuCsv(decodeCsvPayload(req.body));
     if (!rows.length) throw new HttpError(400, "No SKU rows found");
 
     const results = await prisma.$transaction(async () => {
@@ -1148,6 +1999,19 @@ app.post("/kb/skus/import", async (req, res, next) => {
 
     await createOperationLog(req, { shopId, action: "kb.sku.import", targetType: "sku_knowledge", detail: { count: results.length, ip: getClientIp(req) } });
     return sendJson(res, { success: true, count: results.length, skus: results });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.delete("/kb/skus/:id", async (req, res, next) => {
+  try {
+    const shopId = await resolveShopId(req, req.body?.shopId || req.query.shopId);
+    const existing = await prisma.skuKnowledge.findFirst({ where: { id: String(req.params.id), shopId } });
+    if (!existing) throw new HttpError(404, "SKU knowledge not found");
+    await prisma.skuKnowledge.delete({ where: { id: existing.id } });
+    await createOperationLog(req, { shopId, action: "kb.sku.delete", targetType: "sku_knowledge", targetId: existing.id, detail: { sku: existing.sku, title: existing.title } });
+    return sendJson(res, { success: true, deletedId: existing.id });
   } catch (error) {
     return next(error);
   }
@@ -1185,7 +2049,7 @@ app.post("/kb/documents/import", async (req, res, next) => {
       return { document, chunks: plan.chunks };
     });
 
-    await createOperationLog(req, { shopId, action: "kb.document.import", targetType: "kb_document", targetId: result.document.id, detail: { chunks: result.chunks.length, kimi: kimiConfigured() } });
+    await createOperationLog(req, { shopId, action: "kb.document.import", targetType: "kb_document", targetId: result.document.id, detail: { chunks: result.chunks.length, ai: aiConfigured(), provider: selectedAiProvider() } });
     return sendJson(res, { success: true, ...result });
   } catch (error) {
     return next(error);
@@ -1197,6 +2061,51 @@ app.get("/kb/documents", async (req, res, next) => {
     const shopId = await resolveShopId(req);
     const documents = await prisma.kbDocument.findMany({ where: { OR: [{ shopId }, { shopId: null }] }, include: { chunks: true }, orderBy: { updatedAt: "desc" }, take: 200 });
     return sendJson(res, { success: true, documents });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.delete("/kb/documents/:id", async (req, res, next) => {
+  try {
+    const shopId = await resolveShopId(req, req.body?.shopId || req.query.shopId);
+    const existing = await prisma.kbDocument.findFirst({ where: { id: String(req.params.id), shopId } });
+    if (!existing) throw new HttpError(404, "knowledge document not found");
+    await prisma.kbDocument.delete({ where: { id: existing.id } });
+    await createOperationLog(req, { shopId, action: "kb.document.delete", targetType: "kb_document", targetId: existing.id, detail: { title: existing.title, docType: existing.docType } });
+    return sendJson(res, { success: true, deletedId: existing.id });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.patch("/kb/documents/:id", async (req, res, next) => {
+  try {
+    const shopId = await resolveShopId(req, req.body?.shopId);
+    const existing = await prisma.kbDocument.findFirst({ where: { id: String(req.params.id), shopId } });
+    if (!existing) throw new HttpError(404, "knowledge document not found");
+    const title = normalizeText(req.body?.title) || existing.title;
+    const docType = normalizeText(req.body?.docType) || existing.docType;
+    const content = String(req.body?.content ?? existing.content).trim();
+    if (!title || !content) throw new HttpError(400, "title and content are required");
+    const sku = normalizeText(req.body?.sku);
+    const plan = await agenticChunkDocument({ title, docType, content, sku });
+    const result = await prisma.$transaction(async (tx) => {
+      const document = await tx.kbDocument.update({ where: { id: existing.id }, data: { title, docType, content, locale: normalizeText(req.body?.locale) || existing.locale, status: "indexed", active: req.body?.active === undefined ? existing.active : Boolean(req.body.active) } });
+      await tx.kbChunk.deleteMany({ where: { documentId: existing.id } });
+      await tx.kbChunk.createMany({
+        data: plan.chunks.map((chunk) => ({
+          documentId: existing.id,
+          shopId,
+          content: chunk.content,
+          metadata: safeJson({ title: chunk.title, doc_type: chunk.doc_type, sku_tags: chunk.sku_tags, intent_tags: chunk.intent_tags, risk_tags: chunk.risk_tags, source_title: title }) as Prisma.InputJsonValue,
+          scoreHint: chunk.priority
+        }))
+      });
+      return document;
+    });
+    await createOperationLog(req, { shopId, action: "kb.document.update", targetType: "kb_document", targetId: existing.id, detail: { chunks: plan.chunks.length } });
+    return sendJson(res, { success: true, document: result, chunks: plan.chunks });
   } catch (error) {
     return next(error);
   }
@@ -1229,38 +2138,74 @@ app.post("/presale/questions/:id/generate", async (req, res, next) => {
     const shopId = await resolveShopId(req, req.body?.shopId);
     const question = await prisma.presaleQuestion.findFirst({ where: { id: String(req.params.id), shopId } });
     if (!question) throw new HttpError(404, "question not found");
-    const sku = await findSkuKnowledgeForQuestion(question);
-    const rawItem = (question.rawItem || {}) as Record<string, unknown>;
-    const query = `${question.questionText || ""} ${rawItem.title || ""} ${sku?.sku || ""}`;
-    const ragHits = await retrieveKnowledge(shopId, query, { sku: sku?.sku || normalizeText(rawItem.sku), limit: 6 });
-    const draft = await generatePresaleWithAi({
-      questionText: question.questionText || "",
-      itemTitle: normalizeText(rawItem.title),
-      sku: sku?.sku,
-      knowledge: skuToKnowledge(sku),
-      ragHits
-    });
+    const context = await buildPresaleGenerationContext(shopId, question);
+    const draft = await generatePresaleWithAi(context.input);
+    const updated = await savePresaleDraft(shopId, question, draft, { question, sku: context.sku, ragHits: context.ragHits });
 
-    const updated = await prisma.presaleQuestion.update({
-      where: { id: question.id },
-      data: { aiDraft: draft.answer_es_mx, aiConfidence: draft.confidence, riskLevel: draft.risk_level, reviewStatus: draft.needs_human_review ? "needs_human" : "draft_ready" }
-    });
-    await prisma.aiSuggestion.create({
-      data: {
-        shopId,
-        targetType: "presale_question",
-        targetId: question.id,
-        model: optionalEnv("AI_PROVIDER") || "local_rules",
-        promptVersion: kimiConfigured() ? "presale-v2-kimi-rag" : "presale-v2-local-rag",
-        inputSnapshot: safeJson({ question, sku, ragHits }) as unknown as Prisma.InputJsonValue,
-        outputJson: safeJson(draft) as unknown as Prisma.InputJsonValue,
-        outputText: draft.answer_es_mx,
-        riskFlags: draft.policy_flags
-      }
-    });
-
-    return sendJson(res, { success: true, question: updated, draft, ragHits });
+    return sendJson(res, { success: true, question: updated, draft, ragHits: context.ragHits });
   } catch (error) {
+    return next(error);
+  }
+});
+
+function writeSse(res: express.Response, event: string, data: unknown) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(safeJson(data))}\n\n`);
+}
+
+app.post("/presale/questions/:id/generate/stream", async (req, res, next) => {
+  try {
+    const shopId = await resolveShopId(req, req.body?.shopId);
+    const question = await prisma.presaleQuestion.findFirst({ where: { id: String(req.params.id), shopId } });
+    if (!question) throw new HttpError(404, "question not found");
+
+    res.status(200);
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders?.();
+
+    writeSse(res, "status", { message: "正在检索售前知识库..." });
+    const context = await buildPresaleGenerationContext(shopId, question);
+    writeSse(res, "references", { ragHits: context.ragHits });
+
+    const fallback = generateLocalPresaleDraft(context.input);
+    let answer = "";
+    if (aiGenerationEnabled()) {
+      try {
+        let aiStarted = false;
+        writeSse(res, "status", { message: "AI 正在生成回复..." });
+        answer = await streamAiText([
+          { role: "system", content: streamPresaleSystemPrompt() },
+          { role: "user", content: JSON.stringify(context.input) }
+        ], (chunk) => {
+          if (!aiStarted) {
+            writeSse(res, "replace", { text: "" });
+            aiStarted = true;
+          }
+          writeSse(res, "chunk", { text: chunk });
+        });
+      } catch (error) {
+        console.warn("[ai] streaming presale generation failed", error instanceof Error ? error.message : String(error));
+      }
+    }
+
+    if (!answer.trim()) {
+      writeSse(res, "error", { message: aiGenerationEnabled() ? "AI 暂未返回内容，请稍后重试。" : "AI 未配置，无法生成售前回复。" });
+      res.end();
+      return;
+    }
+
+    const draft = buildStreamingPresaleDraft(answer, fallback);
+    const updated = await savePresaleDraft(shopId, question, draft, { question, sku: context.sku, ragHits: context.ragHits, streamed: true });
+    writeSse(res, "done", { success: true, question: updated, draft, ragHits: context.ragHits });
+    res.end();
+  } catch (error) {
+    if (res.headersSent) {
+      writeSse(res, "error", { message: error instanceof Error ? error.message : String(error) });
+      res.end();
+      return;
+    }
     return next(error);
   }
 });
@@ -1268,13 +2213,87 @@ app.post("/presale/questions/:id/generate", async (req, res, next) => {
 app.post("/presale/questions/:id/approve", async (req, res, next) => {
   try {
     const shopId = await resolveShopId(req, req.body?.shopId);
+    const existing = await prisma.presaleQuestion.findFirst({ where: { id: String(req.params.id), shopId } });
+    if (!existing) throw new HttpError(404, "question not found");
+    const answer = String(req.body?.answerText || req.body?.finalAnswer || existing.aiDraft || "").trim();
+    const safety = assertSafePresaleAnswer(answer);
+    if (!safety.safe) throw new HttpError(400, `Unsafe answer: ${safety.flags.join(", ")}`);
     const question = await prisma.presaleQuestion.update({
-      where: { id: String(req.params.id) },
-      data: { finalAnswer: String(req.body?.answerText || req.body?.finalAnswer || "").trim(), reviewStatus: "approved" }
+      where: { id: existing.id },
+      data: { finalAnswer: answer, reviewStatus: "approved" }
     });
-    if (question.shopId !== shopId) throw new HttpError(403, "Cross-shop update blocked");
+    await prisma.aiSuggestion.updateMany({
+      where: { shopId, targetType: "presale_question", targetId: question.id },
+      data: { accepted: true, editedText: answer }
+    });
     await createOperationLog(req, { shopId, action: "presale.approve", targetType: "presale_question", targetId: question.id });
     return sendJson(res, { success: true, question });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.delete("/presale/questions/:id", async (req, res, next) => {
+  try {
+    const shopId = await resolveShopId(req, req.body?.shopId || req.query.shopId);
+    const question = await prisma.presaleQuestion.findFirst({ where: { id: String(req.params.id), shopId } });
+    if (!question) throw new HttpError(404, "question not found");
+    await prisma.$transaction([
+      prisma.aiSuggestion.deleteMany({ where: { shopId, targetType: "presale_question", targetId: question.id } }),
+      prisma.presaleQuestion.delete({ where: { id: question.id } })
+    ]);
+    await createOperationLog(req, { shopId, action: "presale.delete", targetType: "presale_question", targetId: question.id });
+    return sendJson(res, { success: true, deletedId: question.id });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.post("/presale/questions/bulk-approve", async (req, res, next) => {
+  try {
+    const shopId = await resolveShopId(req, req.body?.shopId);
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map((id: unknown) => normalizeText(id)).filter(Boolean) : [];
+    const limit = Math.min(Number(req.body?.limit || 50), 200);
+    const candidates = await prisma.presaleQuestion.findMany({
+      where: {
+        shopId,
+        ...(ids.length ? { id: { in: ids } } : { reviewStatus: "draft_ready", OR: [{ riskLevel: "low" }, { riskLevel: null }] }),
+        aiDraft: { not: null }
+      },
+      orderBy: { updatedAt: "asc" },
+      take: limit
+    });
+
+    const approved: string[] = [];
+    const skipped: Array<{ id: string; reason: string }> = [];
+    for (const question of candidates) {
+      const answer = String(question.aiDraft || "").trim();
+      const safety = assertSafePresaleAnswer(answer);
+      if (!answer) {
+        skipped.push({ id: question.id, reason: "empty_draft" });
+        continue;
+      }
+      if (question.riskLevel && question.riskLevel !== "low") {
+        skipped.push({ id: question.id, reason: "not_low_risk" });
+        continue;
+      }
+      if (!safety.safe) {
+        skipped.push({ id: question.id, reason: `unsafe:${safety.flags.join(",")}` });
+        continue;
+      }
+      await prisma.presaleQuestion.update({
+        where: { id: question.id },
+        data: { finalAnswer: answer, reviewStatus: "approved" }
+      });
+      await prisma.aiSuggestion.updateMany({
+        where: { shopId, targetType: "presale_question", targetId: question.id },
+        data: { accepted: true, editedText: answer }
+      });
+      approved.push(question.id);
+    }
+
+    await createOperationLog(req, { shopId, action: "presale.bulk_approve", targetType: "presale_question", detail: { approved: approved.length, skipped: skipped.length } });
+    return sendJson(res, { success: true, approvedCount: approved.length, skippedCount: skipped.length, approved, skipped });
   } catch (error) {
     return next(error);
   }
@@ -1283,20 +2302,38 @@ app.post("/presale/questions/:id/approve", async (req, res, next) => {
 app.post("/presale/questions/:id/send", async (req, res, next) => {
   try {
     const shopId = await resolveShopId(req, req.body?.shopId);
-    const dryRun = req.body?.dryRun !== false || process.env.AUTO_SEND_PRESALE !== "true";
+    const wantsRealSend = req.body?.dryRun === false;
+    if (wantsRealSend && process.env.AUTO_SEND_PRESALE !== "true") {
+      throw new HttpError(409, "Real Mercado Libre send is disabled. Set AUTO_SEND_PRESALE=true after OAuth and audit checks are ready.");
+    }
+    const dryRun = !wantsRealSend;
     const question = await prisma.presaleQuestion.findFirst({ where: { id: String(req.params.id), shopId } });
     if (!question) throw new HttpError(404, "question not found");
+    const answer = String(req.body?.answerText || question.finalAnswer || question.aiDraft || "").trim();
+    if (!answer) throw new HttpError(400, "answerText is required");
+    const safety = assertSafePresaleAnswer(answer);
+    if (!safety.safe) throw new HttpError(400, `Unsafe answer: ${safety.flags.join(", ")}`);
 
     if (dryRun) {
       const updated = await prisma.presaleQuestion.update({
         where: { id: question.id },
-        data: { finalAnswer: String(req.body?.answerText || question.finalAnswer || question.aiDraft || "").trim(), reviewStatus: "dry_run_sent", sentAt: new Date() }
+        data: { finalAnswer: answer, reviewStatus: "dry_run_sent", sentAt: new Date() }
       });
       await createOperationLog(req, { shopId, action: "presale.send.dry_run", targetType: "presale_question", targetId: question.id });
       return sendJson(res, { success: true, dryRun: true, question: updated });
     }
 
-    return sendJson(res, { success: false, message: "Real POST /answers is not enabled yet. OAuth, status recheck and audit are required." }, 501);
+    const meliResult = await postMeliAnswer(shopId, question.questionId, answer);
+    const updated = await prisma.presaleQuestion.update({
+      where: { id: question.id },
+      data: { finalAnswer: answer, reviewStatus: "sent", questionStatus: "ANSWERED", sentAt: new Date() }
+    });
+    await prisma.aiSuggestion.updateMany({
+      where: { shopId, targetType: "presale_question", targetId: question.id },
+      data: { accepted: true, editedText: answer }
+    });
+    await createOperationLog(req, { shopId, action: "presale.send.real", targetType: "presale_question", targetId: question.id, detail: { questionId: question.questionId.toString() } });
+    return sendJson(res, { success: true, dryRun: false, question: updated, meliResult });
   } catch (error) {
     return next(error);
   }
@@ -1319,18 +2356,17 @@ app.post("/aftersale/threads/:id/analyze", async (req, res, next) => {
     if (!thread) throw new HttpError(404, "thread not found");
 
     const rawContext = (thread.rawContext || {}) as Record<string, unknown>;
-    const sku = await findSkuKnowledgeForThread(thread);
+    const sku = normalizeText(rawContext.sku);
     const latestMessage = normalizeText(req.body?.latestMessage) || thread.messages[0]?.text || normalizeText(rawContext.latestMessage);
-    const ragHits = await retrieveKnowledge(shopId, `${latestMessage} ${thread.orderId || ""}`, { sku: sku?.sku || normalizeText(rawContext.sku), limit: 8 });
     const analysis = await generateAftersaleWithAi({
       latestMessage,
       orderStatus: normalizeText(rawContext.orderStatus),
       shipmentStatus: normalizeText(rawContext.shipmentStatus),
       hasClaim: Boolean(thread.claimId || rawContext.claimId),
       hasReturn: Boolean(thread.returnId || rawContext.returnId),
-      sku: sku?.sku,
-      knowledge: skuToKnowledge(sku),
-      ragHits
+      sku,
+      knowledge: null,
+      ragHits: []
     });
     await ensureDefaultReplyTemplates(shopId);
     const matchedTemplate = await findBestReplyTemplate(shopId, analysis.category, latestMessage);
@@ -1338,8 +2374,8 @@ app.post("/aftersale/threads/:id/analyze", async (req, res, next) => {
       ? fillReplyTemplate(matchedTemplate.content, {
         orderId: thread.orderId?.toString(),
         packId: thread.packId.toString(),
-        sku: sku?.sku || rawContext.sku,
-        itemTitle: sku?.title,
+        sku: sku || rawContext.sku,
+        itemTitle: rawContext.title || rawContext.itemTitle,
         trackingStatus: rawContext.shipmentStatus,
         estimatedDeliveryDate: rawContext.estimatedDeliveryDate
       })
@@ -1349,21 +2385,57 @@ app.post("/aftersale/threads/:id/analyze", async (req, res, next) => {
       where: { id: thread.id },
       data: { category: analysis.category, riskLevel: analysis.risk_level, summary: analysis.summary_zh, suggestedAction: analysis.suggested_action_zh, suggestedReply }
     });
+    const shouldNotifyHuman = analysis.should_escalate_to_human || analysis.category === "human_request";
+    const feishuResult = shouldNotifyHuman
+      ? await notifyFeishuSafely(shopId, [
+        "[Mercado Libre] 售后转人工请求",
+        `Pack: ${thread.packId.toString()}`,
+        `Order: ${thread.orderId?.toString() || "-"}`,
+        `Buyer message: ${latestMessage}`,
+        `Auto reply: ${suggestedReply}`
+      ].join("\n"))
+      : null;
     await prisma.aiSuggestion.create({
       data: {
         shopId,
         targetType: "aftersale_thread",
         targetId: thread.id,
-        model: optionalEnv("AI_PROVIDER") || "local_rules",
-        promptVersion: kimiConfigured() ? "aftersale-v2-kimi-rag" : "aftersale-v2-local-rag",
-        inputSnapshot: safeJson({ thread, latestMessage, sku, ragHits }) as unknown as Prisma.InputJsonValue,
-        outputJson: safeJson({ ...analysis, matchedTemplate: matchedTemplate ? { id: matchedTemplate.id, name: matchedTemplate.name } : null }) as unknown as Prisma.InputJsonValue,
+        model: selectedAiProvider() || "local_rules",
+        promptVersion: aiPromptVersion("aftersale"),
+        inputSnapshot: safeJson({ thread, latestMessage, sku, knowledgeScope: "aftersale_templates_only" }) as unknown as Prisma.InputJsonValue,
+        outputJson: safeJson({ ...analysis, matchedTemplate: matchedTemplate ? { id: matchedTemplate.id, name: matchedTemplate.name } : null, feishuResult }) as unknown as Prisma.InputJsonValue,
         outputText: suggestedReply,
         riskFlags: analysis.forbidden_commitments_detected
       }
     });
 
-    return sendJson(res, { success: true, thread: updated, analysis, suggestedReply, matchedTemplate, ragHits });
+    return sendJson(res, { success: true, thread: updated, analysis, suggestedReply, matchedTemplate, feishuResult, ragHits: [] });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.post("/aftersale/threads/:id/send", async (req, res, next) => {
+  try {
+    const shopId = await resolveShopId(req, req.body?.shopId);
+    const dryRun = req.body?.dryRun !== false || process.env.AUTO_SEND_AFTERSALE !== "true";
+    const thread = await prisma.aftersaleThread.findFirst({ where: { id: String(req.params.id), shopId } });
+    if (!thread) throw new HttpError(404, "thread not found");
+    const replyText = String(req.body?.replyText || thread.suggestedReply || "").trim();
+    if (!replyText) throw new HttpError(400, "replyText is required");
+
+    if (dryRun) {
+      await createOperationLog(req, {
+        shopId,
+        action: "aftersale.send.dry_run",
+        targetType: "aftersale_thread",
+        targetId: thread.id,
+        detail: { packId: thread.packId.toString(), orderId: thread.orderId?.toString(), replyText }
+      });
+      return sendJson(res, { success: true, dryRun: true, message: "Reply recorded as dry run. Real Mercado Libre message send is not enabled yet." });
+    }
+
+    return sendJson(res, { success: false, message: "Real Mercado Libre post-sale message send is not enabled yet. OAuth, message endpoint mapping and audit checks are required." }, 501);
   } catch (error) {
     return next(error);
   }
@@ -1377,6 +2449,23 @@ app.post("/aftersale/threads/:id/close", async (req, res, next) => {
     const updated = await prisma.aftersaleThread.update({ where: { id: thread.id }, data: { status: "closed" } });
     await createOperationLog(req, { shopId, action: "aftersale.close", targetType: "aftersale_thread", targetId: thread.id });
     return sendJson(res, { success: true, thread: updated });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.delete("/aftersale/threads/:id", async (req, res, next) => {
+  try {
+    const shopId = await resolveShopId(req, req.body?.shopId || req.query.shopId);
+    const thread = await prisma.aftersaleThread.findFirst({ where: { id: String(req.params.id), shopId } });
+    if (!thread) throw new HttpError(404, "thread not found");
+    await prisma.$transaction([
+      prisma.aiSuggestion.deleteMany({ where: { shopId, targetType: "aftersale_thread", targetId: thread.id } }),
+      prisma.message.deleteMany({ where: { threadId: thread.id, shopId } }),
+      prisma.aftersaleThread.delete({ where: { id: thread.id } })
+    ]);
+    await createOperationLog(req, { shopId, action: "aftersale.delete", targetType: "aftersale_thread", targetId: thread.id });
+    return sendJson(res, { success: true, deletedId: thread.id });
   } catch (error) {
     return next(error);
   }

@@ -116,9 +116,10 @@ export const presaleSystemPrompt = [
 
 export const aftersaleSystemPrompt = [
   "Eres un asistente de control de calidad y análisis postventa para Mercado Libre México.",
-  "No decides reembolsos, compensaciones ni aceptas responsabilidad; solo sugieres análisis y borradores.",
+  "No decides reembolsos, compensaciones ni aceptas responsabilidad.",
   "Considera mensaje del comprador, historial, orden, logística, claim/return y políticas de tienda.",
-  "Riesgo alto siempre requiere revisión humana.",
+  "El flujo postventa debe responder automáticamente con una respuesta segura de contención incluso si el riesgo es alto.",
+  "Solo marca should_escalate_to_human=true cuando el comprador pida explícitamente hablar con una persona, asesor, humano o ejecutivo.",
   "La respuesta sugerida debe estar en español mexicano, ser breve, empática y segura.",
   "Devuelve JSON válido con el esquema AftersaleAnalysisSchema."
 ].join("\n");
@@ -130,6 +131,25 @@ function includesAny(text: string, patterns: string[]): boolean {
 
 function firstHitText(hits: KnowledgeHit[] | undefined, docType: string): string {
   return hits?.find((hit) => hit.docType === docType)?.content || "";
+}
+
+function buyerRequestsHuman(text: string): boolean {
+  return includesAny(text, [
+    "humano",
+    "persona",
+    "asesor",
+    "agente",
+    "ejecutivo",
+    "representante",
+    "atención humana",
+    "atencion humana",
+    "hablar con alguien",
+    "quiero hablar",
+    "transferir",
+    "pásame",
+    "pasame",
+    "supervisor"
+  ]);
 }
 
 export function generateLocalPresaleDraft(input: LocalPresaleInput): PresaleReply {
@@ -196,19 +216,26 @@ export function generateLocalAftersaleAnalysis(input: LocalAftersaleInput): Afte
   const latest = input.latestMessage || "";
   const evidence: string[] = [];
   const forbidden = findForbiddenPhrases(latest);
+  const humanRequested = buyerRequestsHuman(latest);
   let category: z.infer<typeof AftersaleCategorySchema> = "other";
   let risk: "low" | "medium" | "high" = "low";
   let intent = "Consulta general de postventa";
-  let action = "El agente debe revisar el contexto del pedido y responder de forma conservadora.";
+  let action = "Responder automáticamente con una confirmación segura y conservadora.";
   let reply = "Hola, gracias por contactarnos. Estamos revisando tu caso y te responderemos por este medio a la brevedad.";
 
-  if (input.hasClaim) {
+  if (humanRequested) {
+    category = "human_request";
+    risk = "medium";
+    intent = "El comprador solicita atención de una persona.";
+    action = "Enviar respuesta automática de transferencia y notificar al equipo por Feishu.";
+    reply = "Hola, claro. Ya notificamos a nuestro equipo de atención y una persona revisará tu caso lo antes posible por este mismo chat de Mercado Libre.";
+  } else if (input.hasClaim) {
     category = "claim_opened";
     risk = "high";
-    evidence.push("Existe un claim abierto, requiere revisión humana prioritaria.");
+    evidence.push("Existe un claim abierto; responder con contención segura y revisar prioridad operativa.");
   }
 
-  if (input.hasReturn) {
+  if (!humanRequested && input.hasReturn) {
     category = "return_request";
     risk = "high";
     evidence.push("Existe una devolución asociada, requiere revisar estado y evidencia.");
@@ -229,13 +256,13 @@ export function generateLocalAftersaleAnalysis(input: LocalAftersaleInput): Afte
     category = "damaged_item";
     risk = "high";
     intent = "El comprador reporta producto dañado o defectuoso.";
-    action = "Pedir evidencia, revisar claim/return y escalar a revisión humana.";
+    action = "Pedir evidencia y revisar claim/return sin bloquear la respuesta automática.";
     reply = "Hola, sentimos el inconveniente. Para revisar tu caso, por favor compártenos evidencia del problema por este chat de Mercado Libre.";
   } else if (includesAny(latest, ["reembolso", "devolución", "devolucion", "dinero"])) {
     category = "refund_request";
     risk = "high";
     intent = "El comprador solicita reembolso o devolución.";
-    action = "Escalar a humano y revisar el flujo oficial de Mercado Libre sin prometer reembolso.";
+    action = "Responder con contención y remitir al flujo oficial de Mercado Libre sin prometer reembolso.";
     reply = "Hola, entendemos tu solicitud. Vamos a revisar el estado de tu compra y las opciones disponibles dentro de Mercado Libre.";
   } else if (includesAny(latest, ["garantía", "garantia"])) {
     category = "warranty";
@@ -249,7 +276,7 @@ export function generateLocalAftersaleAnalysis(input: LocalAftersaleInput): Afte
 
   if (forbidden.length) {
     risk = "high";
-    evidence.push("Hay términos sensibles en el mensaje/contexto y se requiere confirmación humana.");
+    evidence.push("Hay términos sensibles en el mensaje/contexto; se usará una respuesta automática conservadora.");
   }
 
   if (input.orderStatus) evidence.push(`Estado de orden: ${input.orderStatus}`);
@@ -268,8 +295,8 @@ export function generateLocalAftersaleAnalysis(input: LocalAftersaleInput): Afte
     evidence,
     suggested_action_zh: action,
     suggested_reply_es_mx: reply,
-    should_reply: risk !== "high",
-    should_escalate_to_human: risk === "high",
+    should_reply: true,
+    should_escalate_to_human: humanRequested,
     forbidden_commitments_detected: forbidden
   });
 }

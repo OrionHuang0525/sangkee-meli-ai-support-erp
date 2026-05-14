@@ -119,6 +119,20 @@ AI_PROVIDER=local
 
 当前 `AI_PROVIDER=local` 使用规则引擎跑通全流程。接入真实模型时，只改后端和 `packages/ai-core`，不要把 API Key 暴露给前端。
 
+NVIDIA Integrate / Kimi K2.6 接入示例：
+
+```env
+AI_PROVIDER=nvidia
+NVIDIA_API_KEY=
+NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+NVIDIA_MODEL=moonshotai/kimi-k2.6
+NVIDIA_STREAM=false
+NVIDIA_THINKING=true
+NVIDIA_MAX_TOKENS=16384
+```
+
+后端会调用 `/chat/completions`，并传入 `chat_template_kwargs.thinking=true`。业务接口需要结构化 JSON，默认关闭 streaming；如需按 SSE 测试可设 `NVIDIA_STREAM=true`。
+
 ## 安全边界
 
 - 默认不自动发送真实 Mercado Libre 回复。

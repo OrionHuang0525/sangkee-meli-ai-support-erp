@@ -1,4 +1,5 @@
 import { Queue, Worker } from "bullmq";
+import crypto from "node:crypto";
 import { Redis } from "ioredis";
 import { Prisma, prisma } from "@meli-ai-support/db";
 import { generateLocalAftersaleAnalysis, generateLocalPresaleDraft } from "@meli-ai-support/ai-core";
@@ -25,6 +26,127 @@ function firstNumber(value: unknown, fallback: bigint): bigint {
 
 function text(value: unknown): string {
   return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+const DEFAULT_AFTERSALE_TEMPLATES = [
+  {
+    name: "转人工安抚",
+    intentCode: "human_request",
+    category: "human_request",
+    keywords: ["humano", "persona", "asesor", "agente", "ejecutivo", "representante", "atención humana", "atencion humana", "supervisor"],
+    content: "Hola, claro. Ya notificamos a nuestro equipo de atención y una persona revisará tu caso lo antes posible por este mismo chat de Mercado Libre.",
+    variables: ["packId", "orderId"]
+  },
+  {
+    name: "物流未收到",
+    intentCode: "not_received",
+    category: "shipping_not_received",
+    keywords: ["no recibí", "no llego", "no ha llegado", "paquete"],
+    content: "Hola, lamentamos lo ocurrido. Te recomendamos revisar el estado del envío desde Mercado Libre. Si el paquete sigue sin actualizarse, por favor continúa el seguimiento desde el flujo oficial de la plataforma.",
+    variables: ["orderId", "trackingStatus"]
+  },
+  {
+    name: "发票问题",
+    intentCode: "invoice_request",
+    category: "invoice_request",
+    keywords: ["factura", "facturar", "cfdi", "rfc"],
+    content: "Hola, gracias por la información. Vamos a revisar los datos de facturación y, si falta algún dato adicional, te contactaremos por este medio.",
+    variables: ["orderId"]
+  },
+  {
+    name: "商品损坏",
+    intentCode: "damaged_item",
+    category: "damaged_product",
+    keywords: ["dañado", "roto", "quebrado", "defecto", "no funciona"],
+    content: "Hola, lamentamos el inconveniente. Para poder revisar el caso, por favor comparte fotos o evidencia del estado del producto dentro del chat de Mercado Libre.",
+    variables: ["itemTitle", "sku"]
+  },
+  {
+    name: "退款兜底",
+    intentCode: "refund_request",
+    category: "refund_request",
+    keywords: ["reembolso", "dinero", "refund", "pago"],
+    content: "Hola, entendemos tu solicitud. Cualquier reembolso debe revisarse y procesarse mediante el flujo oficial de Mercado Libre según el estado del pedido.",
+    variables: ["orderId"]
+  }
+];
+
+async function ensureDefaultAftersaleTemplates(shopId: string) {
+  for (const template of DEFAULT_AFTERSALE_TEMPLATES) {
+    await prisma.replyTemplate.upsert({
+      where: { shopId_name_version: { shopId, name: template.name, version: 1 } },
+      create: {
+        shopId,
+        name: template.name,
+        intentCode: template.intentCode,
+        category: template.category,
+        language: "es-MX",
+        scenario: "售后处理",
+        keywords: template.keywords,
+        content: template.content,
+        variables: template.variables,
+        requiresReview: false
+      },
+      update: { category: template.category, keywords: template.keywords, variables: template.variables, requiresReview: false }
+    });
+  }
+}
+
+function fillReplyTemplate(content: string, values: Record<string, unknown>) {
+  return content.replace(/\{([a-zA-Z0-9_]+)\}/g, (_match, key) => text(values[key]) || "-");
+}
+
+async function findBestReplyTemplate(shopId: string, intentCode: string | null | undefined, latestMessage: string) {
+  const templates = await prisma.replyTemplate.findMany({ where: { shopId, active: true }, orderBy: [{ intentCode: "asc" }, { updatedAt: "desc" }] });
+  if (!templates.length) return null;
+  const normalizedIntent = text(intentCode);
+  const normalizedText = latestMessage.toLowerCase();
+  const exact = templates.find((template) => template.intentCode === normalizedIntent);
+  if (exact) return exact;
+  return templates
+    .map((template) => ({ template, score: template.keywords.reduce((total, keyword) => total + (normalizedText.includes(keyword.toLowerCase()) ? 1 : 0), 0) }))
+    .sort((a, b) => b.score - a.score)[0]?.template || null;
+}
+
+function getEncryptionKey() {
+  const raw = process.env.TOKEN_ENCRYPTION_KEY || "";
+  const key = Buffer.from(raw, "base64");
+  if (key.length !== 32) return null;
+  return key;
+}
+
+function decryptSecret(payload: string): string {
+  const key = getEncryptionKey();
+  if (!key) return "";
+  const [ivB64, tagB64, encryptedB64] = payload.split(".");
+  if (!ivB64 || !tagB64 || !encryptedB64) return "";
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(ivB64, "base64"));
+  decipher.setAuthTag(Buffer.from(tagB64, "base64"));
+  return Buffer.concat([decipher.update(Buffer.from(encryptedB64, "base64")), decipher.final()]).toString("utf8");
+}
+
+function buildFeishuPayload(content: string, secret?: string) {
+  const payload: Record<string, unknown> = { msg_type: "text", content: { text: content } };
+  if (secret) {
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    payload.timestamp = timestamp;
+    payload.sign = crypto.createHmac("sha256", `${timestamp}\n${secret}`).update("").digest("base64");
+  }
+  return payload;
+}
+
+async function notifyFeishuForHumanRequest(shopId: string, content: string) {
+  const setting = await prisma.settingsRule.findUnique({ where: { shopId_key: { shopId, key: "feishu_webhook" } } });
+  const config = setting?.active ? setting.value as { webhookUrlEnc?: string; secretEnc?: string; enabled?: boolean; notifyAftersale?: boolean } : null;
+  if (!config?.enabled || config.notifyAftersale === false || !config.webhookUrlEnc) return;
+  const webhookUrl = decryptSecret(config.webhookUrlEnc);
+  if (!webhookUrl) return;
+  const response = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(buildFeishuPayload(content, config.secretEnc ? decryptSecret(config.secretEnc) : ""))
+  });
+  if (!response.ok) console.warn("[feishu] human request notify failed", response.status, await response.text());
 }
 
 async function getShopForEvent(userId?: bigint | null) {
@@ -198,16 +320,25 @@ async function processAftersaleMessage(eventId: string) {
     }
   }).catch(() => undefined);
 
-  const knowledge = await findSku(shop.id, undefined, sku);
   const analysis = generateLocalAftersaleAnalysis({
     latestMessage,
     orderStatus: text(payload.orderStatus || payload.order_status),
     shipmentStatus: text(payload.shipmentStatus || payload.shipment_status),
     hasClaim: Boolean(payload.claim_id || payload.claimId),
     hasReturn: Boolean(payload.return_id || payload.returnId),
-    sku,
-    knowledge
+    sku
   });
+  await ensureDefaultAftersaleTemplates(shop.id);
+  const matchedTemplate = await findBestReplyTemplate(shop.id, analysis.category, latestMessage);
+  const suggestedReply = matchedTemplate
+    ? fillReplyTemplate(matchedTemplate.content, {
+      orderId: text(payload.order_id || payload.orderId),
+      packId: packId.toString(),
+      sku,
+      itemTitle: text(payload.title || payload.itemTitle),
+      trackingStatus: text(payload.shipmentStatus || payload.shipment_status)
+    })
+    : analysis.suggested_reply_es_mx;
 
   const updated = await prisma.aftersaleThread.update({
     where: { id: thread.id },
@@ -216,18 +347,28 @@ async function processAftersaleMessage(eventId: string) {
       riskLevel: analysis.risk_level,
       summary: analysis.summary_zh,
       suggestedAction: analysis.suggested_action_zh,
-      suggestedReply: analysis.suggested_reply_es_mx
+      suggestedReply
     }
   });
+
+  if (analysis.should_escalate_to_human || analysis.category === "human_request") {
+    await notifyFeishuForHumanRequest(shop.id, [
+      "[Mercado Libre] 售后转人工请求",
+      `Pack: ${packId.toString()}`,
+      `Order: ${text(payload.order_id || payload.orderId) || "-"}`,
+      `Buyer message: ${latestMessage}`,
+      `Auto reply: ${suggestedReply}`
+    ].join("\n"));
+  }
 
   await createSuggestion({
     shopId: shop.id,
     targetType: "aftersale_thread",
     targetId: updated.id,
     promptVersion: "aftersale-v1-local",
-    inputSnapshot: { event, knowledge },
-    outputJson: analysis,
-    outputText: analysis.suggested_reply_es_mx,
+    inputSnapshot: { event, knowledgeScope: "aftersale_templates_only" },
+    outputJson: { ...analysis, matchedTemplate: matchedTemplate ? { id: matchedTemplate.id, name: matchedTemplate.name } : null },
+    outputText: suggestedReply,
     riskFlags: analysis.forbidden_commitments_detected
   });
 }
@@ -240,8 +381,8 @@ async function processClaim(eventId: string) {
   const shop = await getShopForEvent(event.userId);
   const packId = firstNumber(payload.pack_id || payload.packId || event.resource, BigInt(Date.now()));
   const claimId = firstNumber(payload.claim_id || payload.claimId || event.resource, BigInt(0));
-  const summary = "Claim abierto, requiere revisión humana prioritaria.";
-  const suggestedAction = "Entrar al claim de Mercado Libre y revisar motivo, evidencia, vencimiento y acciones disponibles.";
+  const summary = "Claim abierto, se enviará una respuesta automática segura y se mantendrá seguimiento operativo.";
+  const suggestedAction = "Responder con contención, revisar motivo/evidencia/vencimiento y continuar dentro del flujo oficial de Mercado Libre.";
   const suggestedReply = "Hola, estamos revisando tu caso dentro de Mercado Libre. Te responderemos por este medio con la información correspondiente.";
 
   await prisma.aftersaleThread.upsert({
