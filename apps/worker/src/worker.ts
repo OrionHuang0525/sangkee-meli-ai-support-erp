@@ -19,6 +19,10 @@ function safeJson<T>(value: T): T {
   })) as T;
 }
 
+function queueJobId(value: string) {
+  return crypto.createHash("sha256").update(value).digest("hex");
+}
+
 function firstNumber(value: unknown, fallback: bigint): bigint {
   const match = String(value || "").match(/\d{6,}/);
   return match ? BigInt(match[0]) : fallback;
@@ -26,6 +30,124 @@ function firstNumber(value: unknown, fallback: bigint): bigint {
 
 function text(value: unknown): string {
   return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+type HandoffReason = "buyer_requested_human" | "invoice_required" | "unmatched_other" | "ai_escalation";
+
+type HandoffDecision = {
+  required: boolean;
+  reason?: HandoffReason;
+  label?: string;
+};
+
+function decideAftersaleHandoff(input: { category?: string | null; shouldEscalate?: boolean | null; status?: string | null }): HandoffDecision {
+  const category = text(input.category);
+  if (category === "human_request") return { required: true, reason: "buyer_requested_human", label: "买家要求人工" };
+  if (category === "invoice_request") return { required: true, reason: "invoice_required", label: "开票待人工" };
+  if (category === "other") return { required: true, reason: "unmatched_other", label: "未识别问题转人工" };
+  if (input.status === "human_pending") return { required: true, reason: "ai_escalation", label: "人工待处理" };
+  return { required: false };
+}
+
+function pickInvoiceValue(value: string, patterns: RegExp[]) {
+  for (const pattern of patterns) {
+    const match = value.match(pattern);
+    const matched = text(match?.[1])
+      .replace(/\s+(RFC|raz[oó]n social|nombre fiscal|r[eé]gimen fiscal|regimen|uso de cfdi|cfdi|forma de pago|m[eé]todo de pago|metodo de pago|c[oó]digo postal fiscal|codigo postal fiscal|cp fiscal|c\.?p\.?)\b.*$/i, "")
+      .replace(/[。.;；,，]+$/, "");
+    if (matched) return matched.slice(0, 80);
+  }
+  return "";
+}
+
+function buildInvoiceFieldSummary(conversationText: string) {
+  const compact = conversationText.replace(/\s+/g, " ").trim();
+  const fields = [
+    {
+      label: "RFC",
+      value: pickInvoiceValue(compact, [
+        /\bRFC\s*[:：]?\s*([A-ZÑ&]{3,4}\d{6}[A-Z0-9]{3})\b/i,
+        /\b([A-ZÑ&]{3,4}\d{6}[A-Z0-9]{3})\b/i
+      ])
+    },
+    {
+      label: "Razón social",
+      value: pickInvoiceValue(compact, [
+        /raz[oó]n social\s*[:：]?\s*([^,;，；\n]+)/i,
+        /nombre fiscal\s*[:：]?\s*([^,;，；\n]+)/i
+      ])
+    },
+    {
+      label: "Régimen fiscal",
+      value: pickInvoiceValue(compact, [
+        /r[eé]gimen fiscal\s*[:：]?\s*([^,;，；\n]+)/i,
+        /regimen\s*[:：]?\s*([^,;，；\n]+)/i
+      ])
+    },
+    {
+      label: "Uso de CFDI",
+      value: pickInvoiceValue(compact, [
+        /uso de cfdi\s*[:：]?\s*([^,;，；\n]+)/i,
+        /cfdi\s*[:：]?\s*([^,;，；\n]+)/i
+      ])
+    },
+    {
+      label: "Forma de pago",
+      value: pickInvoiceValue(compact, [
+        /forma de pago\s*[:：]?\s*([^,;，；\n]+)/i,
+        /m[eé]todo de pago\s*[:：]?\s*([^,;，；\n]+)/i,
+        /metodo de pago\s*[:：]?\s*([^,;，；\n]+)/i
+      ])
+    },
+    {
+      label: "Código postal fiscal",
+      value: pickInvoiceValue(compact, [
+        /c[oó]digo postal fiscal\s*[:：]?\s*(\d{5})/i,
+        /codigo postal fiscal\s*[:：]?\s*(\d{5})/i,
+        /\bcp fiscal\s*[:：]?\s*(\d{5})/i,
+        /\bc\.?p\.?\s*[:：]?\s*(\d{5})/i
+      ])
+    }
+  ];
+
+  return fields.map((field) => `- ${field.label}: ${field.value ? `已收到 ${field.value}` : "待买家补充"}`).join("\n");
+}
+
+function buildAftersaleHandoffNotice(input: {
+  shopName?: string | null;
+  handoff: HandoffDecision;
+  packId: string;
+  orderId?: string | null;
+  buyerMessage: string;
+  conversationText?: string | null;
+  suggestedAction?: string | null;
+  suggestedReply?: string | null;
+}) {
+  const title = input.handoff.reason === "invoice_required"
+    ? "[Mercado Libre] 开票待处理"
+    : input.handoff.reason === "unmatched_other"
+      ? "[Mercado Libre] 未识别售后问题转人工"
+      : "[Mercado Libre] 售后转人工提醒";
+  const lines = [
+    title,
+    `Shop: ${input.shopName || "-"}`,
+    `Pack: ${input.packId}`,
+    `Order: ${input.orderId || "-"}`,
+    `Reason: ${input.handoff.label || "-"}`,
+    `Buyer message: ${input.buyerMessage}`,
+    `Suggested action: ${input.suggestedAction || "-"}`
+  ];
+  if (input.handoff.reason === "invoice_required") {
+    lines.push(
+      "",
+      "开票资料核对：",
+      buildInvoiceFieldSummary(input.conversationText || input.buyerMessage),
+      "",
+      "客服动作：请优先检查待补充项，确认资料齐全后再人工开票；不要引导买家到 Mercado Libre 站外提交资料。"
+    );
+  }
+  if (input.suggestedReply) lines.push(`Auto reply: ${input.suggestedReply}`);
+  return lines.join("\n");
 }
 
 const DEFAULT_AFTERSALE_TEMPLATES = [
@@ -50,8 +172,9 @@ const DEFAULT_AFTERSALE_TEMPLATES = [
     intentCode: "invoice_request",
     category: "invoice_request",
     keywords: ["factura", "facturar", "cfdi", "rfc"],
-    content: "Hola, gracias por la información. Vamos a revisar los datos de facturación y, si falta algún dato adicional, te contactaremos por este medio.",
-    variables: ["orderId"]
+    content: "Hola, con gusto te apoyamos con la factura. Por favor compártenos por este chat de Mercado Libre tu RFC, razón social, régimen fiscal, uso de CFDI, forma de pago y código postal fiscal para que nuestro equipo pueda revisarlo.",
+    variables: ["orderId"],
+    requiresReview: true
   },
   {
     name: "商品损坏",
@@ -68,6 +191,15 @@ const DEFAULT_AFTERSALE_TEMPLATES = [
     keywords: ["reembolso", "dinero", "refund", "pago"],
     content: "Hola, entendemos tu solicitud. Cualquier reembolso debe revisarse y procesarse mediante el flujo oficial de Mercado Libre según el estado del pedido.",
     variables: ["orderId"]
+  },
+  {
+    name: "未识别问题转人工",
+    intentCode: "other",
+    category: "other",
+    keywords: [],
+    content: "Hola, gracias por escribirnos. Vamos a revisar tu caso con nuestro equipo de atención y te responderemos por este mismo chat de Mercado Libre.",
+    variables: ["packId", "orderId"],
+    requiresReview: true
   }
 ];
 
@@ -85,9 +217,9 @@ async function ensureDefaultAftersaleTemplates(shopId: string) {
         keywords: template.keywords,
         content: template.content,
         variables: template.variables,
-        requiresReview: false
+        requiresReview: "requiresReview" in template && Boolean(template.requiresReview)
       },
-      update: { category: template.category, keywords: template.keywords, variables: template.variables, requiresReview: false }
+      update: { category: template.category, keywords: template.keywords, content: template.content, variables: template.variables, requiresReview: "requiresReview" in template && Boolean(template.requiresReview) }
     });
   }
 }
@@ -96,33 +228,59 @@ function fillReplyTemplate(content: string, values: Record<string, unknown>) {
   return content.replace(/\{([a-zA-Z0-9_]+)\}/g, (_match, key) => text(values[key]) || "-");
 }
 
+function replyTemplateKeywordScore(template: { keywords: string[] }, normalizedText: string) {
+  return template.keywords.reduce((total, keyword) => {
+    const normalizedKeyword = text(keyword).toLowerCase();
+    return total + (normalizedKeyword && normalizedText.includes(normalizedKeyword) ? 1 : 0);
+  }, 0);
+}
+
 async function findBestReplyTemplate(shopId: string, intentCode: string | null | undefined, latestMessage: string) {
   const templates = await prisma.replyTemplate.findMany({ where: { shopId, active: true }, orderBy: [{ intentCode: "asc" }, { updatedAt: "desc" }] });
   if (!templates.length) return null;
   const normalizedIntent = text(intentCode);
   const normalizedText = latestMessage.toLowerCase();
-  const exact = templates.find((template) => template.intentCode === normalizedIntent);
-  if (exact) return exact;
-  return templates
-    .map((template) => ({ template, score: template.keywords.reduce((total, keyword) => total + (normalizedText.includes(keyword.toLowerCase()) ? 1 : 0), 0) }))
-    .sort((a, b) => b.score - a.score)[0]?.template || null;
+  const exactMatches = templates.filter((template) => template.intentCode === normalizedIntent);
+  if (exactMatches.length === 1) return exactMatches[0];
+  if (exactMatches.length > 1) {
+    const scoredMatches = exactMatches
+      .map((template) => ({ template, score: replyTemplateKeywordScore(template, normalizedText) }))
+      .sort((a, b) => b.score - a.score || b.template.updatedAt.getTime() - a.template.updatedAt.getTime());
+    if (scoredMatches[0]?.score > 0 && scoredMatches[0].score > (scoredMatches[1]?.score ?? -1)) return scoredMatches[0].template;
+    return null;
+  }
+  const scored = templates
+    .map((template) => ({ template, score: replyTemplateKeywordScore(template, normalizedText) }))
+    .sort((a, b) => b.score - a.score || b.template.updatedAt.getTime() - a.template.updatedAt.getTime());
+  if (scored[0]?.score > 0 && scored[0].score > (scored[1]?.score ?? -1)) return scored[0].template;
+  return templates.find((template) => template.intentCode === "other") || null;
 }
 
 function getEncryptionKey() {
   const raw = process.env.TOKEN_ENCRYPTION_KEY || "";
-  const key = Buffer.from(raw, "base64");
-  if (key.length !== 32) return null;
-  return key;
+  const asBase64 = Buffer.from(raw, "base64");
+  if (asBase64.length === 32) return asBase64;
+  const asHex = Buffer.from(raw, "hex");
+  if (asHex.length === 32) return asHex;
+  const utf8 = Buffer.from(raw, "utf8");
+  if (utf8.length === 32) return utf8;
+  return null;
 }
 
 function decryptSecret(payload: string): string {
   const key = getEncryptionKey();
   if (!key) return "";
-  const [ivB64, tagB64, encryptedB64] = payload.split(".");
-  if (!ivB64 || !tagB64 || !encryptedB64) return "";
-  const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(ivB64, "base64"));
-  decipher.setAuthTag(Buffer.from(tagB64, "base64"));
-  return Buffer.concat([decipher.update(Buffer.from(encryptedB64, "base64")), decipher.final()]).toString("utf8");
+  try {
+    const raw = Buffer.from(payload, "base64");
+    const iv = raw.subarray(0, 12);
+    const tag = raw.subarray(12, 28);
+    const encrypted = raw.subarray(28);
+    const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+    decipher.setAuthTag(tag);
+    return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString("utf8");
+  } catch {
+    return "";
+  }
 }
 
 function buildFeishuPayload(content: string, secret?: string) {
@@ -209,11 +367,11 @@ async function routeWebhookEvent(dedupeKey: string) {
   await prisma.webhookEvent.update({ where: { id: event.id }, data: { attempts: { increment: 1 }, status: "processing" } });
 
   if (event.topic === "questions") {
-    await presaleQueue.add("process-presale-question", { eventId: event.id }, { jobId: event.dedupeKey || event.id });
+    await presaleQueue.add("process-presale-question", { eventId: event.id }, { jobId: queueJobId(event.dedupeKey || event.id) });
   } else if (event.topic === "messages") {
-    await aftersaleQueue.add("process-aftersale-message", { eventId: event.id }, { jobId: event.dedupeKey || event.id });
+    await aftersaleQueue.add("process-aftersale-message", { eventId: event.id }, { jobId: queueJobId(event.dedupeKey || event.id) });
   } else if (event.topic === "claims") {
-    await claimQueue.add("process-claim", { eventId: event.id }, { jobId: event.dedupeKey || event.id });
+    await claimQueue.add("process-claim", { eventId: event.id }, { jobId: queueJobId(event.dedupeKey || event.id) });
   }
 
   await prisma.webhookEvent.update({ where: { id: event.id }, data: { status: "processed", processedAt: new Date() } });
@@ -320,8 +478,15 @@ async function processAftersaleMessage(eventId: string) {
     }
   }).catch(() => undefined);
 
+  const recentMessages = await prisma.message.findMany({
+    where: { threadId: thread.id, shopId: shop.id },
+    orderBy: { messageDate: "desc" },
+    take: 20
+  });
+  const conversationHistory = recentMessages.slice().reverse().map((message) => text(message.text)).filter(Boolean);
   const analysis = generateLocalAftersaleAnalysis({
     latestMessage,
+    conversationHistory,
     orderStatus: text(payload.orderStatus || payload.order_status),
     shipmentStatus: text(payload.shipmentStatus || payload.shipment_status),
     hasClaim: Boolean(payload.claim_id || payload.claimId),
@@ -339,10 +504,12 @@ async function processAftersaleMessage(eventId: string) {
       trackingStatus: text(payload.shipmentStatus || payload.shipment_status)
     })
     : analysis.suggested_reply_es_mx;
+  const handoff = decideAftersaleHandoff({ category: analysis.category, shouldEscalate: analysis.should_escalate_to_human });
 
   const updated = await prisma.aftersaleThread.update({
     where: { id: thread.id },
     data: {
+      status: handoff.required ? "human_pending" : "open",
       category: analysis.category,
       riskLevel: analysis.risk_level,
       summary: analysis.summary_zh,
@@ -351,14 +518,17 @@ async function processAftersaleMessage(eventId: string) {
     }
   });
 
-  if (analysis.should_escalate_to_human || analysis.category === "human_request") {
-    await notifyFeishuForHumanRequest(shop.id, [
-      "[Mercado Libre] 售后转人工请求",
-      `Pack: ${packId.toString()}`,
-      `Order: ${text(payload.order_id || payload.orderId) || "-"}`,
-      `Buyer message: ${latestMessage}`,
-      `Auto reply: ${suggestedReply}`
-    ].join("\n"));
+  if (handoff.required) {
+    await notifyFeishuForHumanRequest(shop.id, buildAftersaleHandoffNotice({
+      shopName: shop.nickname,
+      handoff,
+      packId: packId.toString(),
+      orderId: text(payload.order_id || payload.orderId) || undefined,
+      buyerMessage: latestMessage,
+      conversationText: conversationHistory.join("\n"),
+      suggestedAction: analysis.suggested_action_zh,
+      suggestedReply
+    }));
   }
 
   await createSuggestion({
@@ -366,8 +536,8 @@ async function processAftersaleMessage(eventId: string) {
     targetType: "aftersale_thread",
     targetId: updated.id,
     promptVersion: "aftersale-v1-local",
-    inputSnapshot: { event, knowledgeScope: "aftersale_templates_only" },
-    outputJson: { ...analysis, matchedTemplate: matchedTemplate ? { id: matchedTemplate.id, name: matchedTemplate.name } : null },
+    inputSnapshot: { event, conversationHistory, knowledgeScope: "aftersale_templates_only" },
+    outputJson: { ...analysis, handoff, matchedTemplate: matchedTemplate ? { id: matchedTemplate.id, name: matchedTemplate.name } : null },
     outputText: suggestedReply,
     riskFlags: analysis.forbidden_commitments_detected
   });

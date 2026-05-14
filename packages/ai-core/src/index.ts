@@ -74,6 +74,7 @@ export interface LocalPresaleInput {
 
 export interface LocalAftersaleInput {
   latestMessage?: string | null;
+  conversationHistory?: string[];
   orderStatus?: string | null;
   shipmentStatus?: string | null;
   hasClaim?: boolean;
@@ -214,9 +215,11 @@ export function generateLocalPresaleDraft(input: LocalPresaleInput): PresaleRepl
 
 export function generateLocalAftersaleAnalysis(input: LocalAftersaleInput): AftersaleAnalysis {
   const latest = input.latestMessage || "";
+  const contextText = [...(input.conversationHistory || []), latest].filter(Boolean).join("\n");
+  const routeText = contextText || latest;
   const evidence: string[] = [];
-  const forbidden = findForbiddenPhrases(latest);
-  const humanRequested = buyerRequestsHuman(latest);
+  const forbidden = findForbiddenPhrases(routeText);
+  const humanRequested = buyerRequestsHuman(routeText);
   let category: z.infer<typeof AftersaleCategorySchema> = "other";
   let risk: "low" | "medium" | "high" = "low";
   let intent = "Consulta general de postventa";
@@ -241,30 +244,31 @@ export function generateLocalAftersaleAnalysis(input: LocalAftersaleInput): Afte
     evidence.push("Existe una devolución asociada, requiere revisar estado y evidencia.");
   }
 
-  if (includesAny(latest, ["factura", "cfdi", "facturación", "facturacion"])) {
+  if (includesAny(routeText, ["factura", "facturar", "cfdi", "rfc", "facturación", "facturacion"])) {
     category = "invoice_request";
+    risk = "medium";
     intent = "El comprador solicita factura o datos de facturación.";
-    action = "Revisar datos fiscales, monto y orden; si falta información, pedirla por el chat de Mercado Libre.";
-    reply = "Hola, gracias por la información. Vamos a revisar los datos de facturación y, si falta algún dato adicional, te contactaremos por este medio.";
-  } else if (includesAny(latest, ["no lleg", "no he recibido", "no recibido"])) {
+    action = "Crear tarea humana de facturación; pedir datos fiscales completos dentro del chat de Mercado Libre.";
+    reply = "Hola, con gusto te apoyamos con la factura. Por favor compártenos por este chat de Mercado Libre tu RFC, razón social, régimen fiscal, uso de CFDI, forma de pago y código postal fiscal para que nuestro equipo pueda revisarlo.";
+  } else if (includesAny(routeText, ["no lleg", "no he recibido", "no recibido"])) {
     category = "not_received";
     risk = input.shipmentStatus?.toLowerCase().includes("delivered") ? "high" : "medium";
     intent = "El comprador indica que no recibió el paquete.";
     action = "Revisar tracking y estado de entrega antes de prometer una solución.";
     reply = "Hola, lamentamos el inconveniente. Vamos a revisar el estado del envío y te compartiremos la información disponible por este medio.";
-  } else if (includesAny(latest, ["dañado", "danado", "roto", "no funciona", "defecto"])) {
+  } else if (includesAny(routeText, ["dañado", "danado", "roto", "no funciona", "defecto"])) {
     category = "damaged_item";
     risk = "high";
     intent = "El comprador reporta producto dañado o defectuoso.";
     action = "Pedir evidencia y revisar claim/return sin bloquear la respuesta automática.";
     reply = "Hola, sentimos el inconveniente. Para revisar tu caso, por favor compártenos evidencia del problema por este chat de Mercado Libre.";
-  } else if (includesAny(latest, ["reembolso", "devolución", "devolucion", "dinero"])) {
+  } else if (includesAny(routeText, ["reembolso", "devolución", "devolucion", "dinero"])) {
     category = "refund_request";
     risk = "high";
     intent = "El comprador solicita reembolso o devolución.";
     action = "Responder con contención y remitir al flujo oficial de Mercado Libre sin prometer reembolso.";
     reply = "Hola, entendemos tu solicitud. Vamos a revisar el estado de tu compra y las opciones disponibles dentro de Mercado Libre.";
-  } else if (includesAny(latest, ["garantía", "garantia"])) {
+  } else if (includesAny(routeText, ["garantía", "garantia"])) {
     category = "warranty";
     risk = "medium";
     intent = "El comprador consulta garantía.";
@@ -296,7 +300,7 @@ export function generateLocalAftersaleAnalysis(input: LocalAftersaleInput): Afte
     suggested_action_zh: action,
     suggested_reply_es_mx: reply,
     should_reply: true,
-    should_escalate_to_human: humanRequested,
+    should_escalate_to_human: humanRequested || category === "invoice_request" || category === "other",
     forbidden_commitments_detected: forbidden
   });
 }

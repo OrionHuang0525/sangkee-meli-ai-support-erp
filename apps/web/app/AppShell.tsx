@@ -5,6 +5,13 @@ import { useEffect, useMemo, useState } from "react";
 type Tab = "today" | "consultations" | "aftersale" | "reviews" | "knowledge" | "templates" | "stats" | "shop";
 type AnyRecord = Record<string, unknown>;
 type CsvEncoding = "auto" | "utf-8" | "gb18030" | "utf-16le" | "big5";
+type FileDraft = {
+  fileName: string;
+  fileType: string;
+  mimeType: string;
+  sizeLabel: string;
+  preview: string;
+};
 
 interface AppShellProps {
   apiUrl: string;
@@ -34,6 +41,7 @@ function statusText(value: string) {
     sent: "已发送",
     dry_run_sent: "已记录发送",
     open: "待跟进",
+    human_pending: "人工待处理",
     closed: "已关闭",
     low: "低",
     medium: "中",
@@ -48,6 +56,11 @@ function statusText(value: string) {
     refund_request: "退款请求",
     return_request: "退换货",
     warranty: "保修咨询",
+    other: "未识别问题",
+    buyer_requested_human: "买家要求人工",
+    invoice_required: "开票待人工",
+    unmatched_other: "未识别问题",
+    ai_escalation: "风险规则转人工",
     indexed: "可使用",
     failed: "处理失败",
     partial_failed: "部分失败"
@@ -77,17 +90,69 @@ function matchText(score: string) {
   return "低";
 }
 
+function asChart(value: unknown, key: string): AnyRecord[] {
+  return asList<AnyRecord>(value, key).filter((item) => Number(valueOf(item, "value")) > 0);
+}
+
+function chartMax(items: AnyRecord[]) {
+  return Math.max(1, ...items.map((item) => Number(valueOf(item, "value") || 0)));
+}
+
+function percentOf(value: string, max: number) {
+  const number = Number(value || 0);
+  if (number <= 0) return "0%";
+  return `${Math.max(4, Math.round((number / max) * 100))}%`;
+}
+
+function displayDateTime(value: string) {
+  if (!value) return "";
+  return value.replace("T", " ").slice(0, 16);
+}
+
+function messageRole(message: AnyRecord) {
+  const direction = valueOf(message, "direction");
+  if (direction === "outbound") return "assistant";
+  if (direction === "system") return "system";
+  return "customer";
+}
+
+function messageRoleText(role: string) {
+  if (role === "assistant") return "客服/机器人回复";
+  if (role === "system") return "系统记录";
+  return "买家消息";
+}
+
+function presaleReplyLabel(question: AnyRecord) {
+  const status = valueOf(question, "reviewStatus");
+  if (status === "sent") return "已正式发送到平台";
+  if (status === "approved" || valueOf(question, "finalAnswer")) return "待发送回复";
+  if (valueOf(question, "aiDraft")) return "AI 草稿，待审核";
+  return "";
+}
+
 async function requestJson(apiUrl: string, path: string, init?: RequestInit) {
-  const response = await fetch(`${apiUrl}${path}`, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      "X-User-Email": "local-admin@local",
-      ...(init?.headers || {})
-    }
-  });
-  const data = await response.json();
-  if (!response.ok || data.success === false) throw new Error(data.message || `HTTP ${response.status}`);
+  let response: Response;
+  try {
+    response = await fetch(`${apiUrl}${path}`, {
+      ...init,
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        "X-User-Email": "local-admin@local",
+        ...(init?.headers || {})
+      }
+    });
+  } catch {
+    throw new Error(`无法连接客服后端。请确认 API 服务已启动，并且前端配置的地址是 ${apiUrl}`);
+  }
+
+  const text = await response.text();
+  let data: AnyRecord = {};
+  try {
+    data = text ? JSON.parse(text) as AnyRecord : {};
+  } catch {
+    throw new Error(response.ok ? "后端返回了无法识别的内容" : `后端请求失败：HTTP ${response.status}`);
+  }
+  if (!response.ok || data.success === false) throw new Error(String(data.message || `HTTP ${response.status}`));
   return data;
 }
 
@@ -109,9 +174,65 @@ function decodeBuffer(buffer: ArrayBuffer, encoding: Exclude<CsvEncoding, "auto"
   return new TextDecoder(label, { fatal: encoding === "utf-8" }).decode(buffer);
 }
 
+function isWorkbookBuffer(buffer: ArrayBuffer) {
+  const bytes = new Uint8Array(buffer.slice(0, 4));
+  return bytes[0] === 0x50 && bytes[1] === 0x4b;
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.slice(index, index + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function extensionOf(fileName: string) {
+  return fileName.toLowerCase().match(/\.([a-z0-9]+)$/)?.[1] || "";
+}
+
+function formatFileSize(size: number) {
+  if (size >= 1024 * 1024) return `${(size / 1024 / 1024).toFixed(1)} MB`;
+  if (size >= 1024) return `${Math.round(size / 1024)} KB`;
+  return `${size} B`;
+}
+
+function fileTypeLabel(extension: string) {
+  const map: Record<string, string> = {
+    csv: "CSV 商品表",
+    txt: "文本资料",
+    xlsx: "Excel 商品表",
+    xls: "Excel 商品表",
+    pdf: "PDF 文档",
+    docx: "Word 文档"
+  };
+  return map[extension] || "未知文件";
+}
+
+function canUseAsProductFile(extension: string) {
+  return ["csv", "txt", "xlsx", "xls"].includes(extension);
+}
+
+function canUseAsDocumentFile(extension: string) {
+  return ["txt", "pdf", "docx"].includes(extension);
+}
+
 async function decodeFile(file: File, encoding: CsvEncoding) {
   const buffer = await file.arrayBuffer();
-  if (encoding !== "auto") return decodeBuffer(buffer, encoding);
+  if (isWorkbookBuffer(buffer)) {
+    return {
+      kind: "workbook" as const,
+      fileName: file.name,
+      mimeType: file.type,
+      sizeLabel: formatFileSize(file.size),
+      base64: arrayBufferToBase64(buffer),
+      preview: `已选择 Excel 工作簿：${file.name}\n保存后会解析多工作表，并生成可用于售前回复的商品资料。`
+    };
+  }
+
+  if (encoding !== "auto") return { kind: "text" as const, text: decodeBuffer(buffer, encoding).replace(/^\uFEFF/, "") };
 
   const candidates: Array<Exclude<CsvEncoding, "auto">> = ["utf-8", "gb18030", "utf-16le", "big5"];
   const decoded = candidates.flatMap((candidate) => {
@@ -124,12 +245,12 @@ async function decodeFile(file: File, encoding: CsvEncoding) {
   });
 
   const best = decoded.sort((a, b) => a.score - b.score)[0];
-  if (best) return best.text;
+  if (best) return { kind: "text" as const, text: best.text };
 
   try {
-    return new TextDecoder("gb18030").decode(buffer);
+    return { kind: "text" as const, text: new TextDecoder("gb18030").decode(buffer) };
   } catch {
-    return new TextDecoder("utf-8").decode(buffer);
+    return { kind: "text" as const, text: new TextDecoder("utf-8").decode(buffer) };
   }
 }
 
@@ -143,15 +264,22 @@ export default function AppShell({ apiUrl }: AppShellProps) {
   const [threads, setThreads] = useState<AnyRecord[]>([]);
   const [templates, setTemplates] = useState<AnyRecord[]>([]);
   const [reviews, setReviews] = useState<AnyRecord[]>([]);
-  const [logs, setLogs] = useState<AnyRecord[]>([]);
   const [feishu, setFeishu] = useState<AnyRecord | null>(null);
   const [automation, setAutomation] = useState<AnyRecord | null>(null);
   const [selectedShop, setSelectedShop] = useState("");
   const [productText, setProductText] = useState("");
+  const [productFileBase64, setProductFileBase64] = useState("");
+  const [productFileName, setProductFileName] = useState("");
+  const [productFileMimeType, setProductFileMimeType] = useState("");
+  const [productFileInfo, setProductFileInfo] = useState<FileDraft | null>(null);
   const [docTitle, setDocTitle] = useState("");
   const [docType, setDocType] = useState("invoice");
   const [docSku, setDocSku] = useState("");
   const [docContent, setDocContent] = useState("");
+  const [docFileBase64, setDocFileBase64] = useState("");
+  const [docFileName, setDocFileName] = useState("");
+  const [docFileMimeType, setDocFileMimeType] = useState("");
+  const [docFileInfo, setDocFileInfo] = useState<FileDraft | null>(null);
   const [referenceQuery, setReferenceQuery] = useState("");
   const [referenceHits, setReferenceHits] = useState<AnyRecord[]>([]);
   const [templateName, setTemplateName] = useState("");
@@ -161,7 +289,7 @@ export default function AppShell({ apiUrl }: AppShellProps) {
   const [editingDocumentId, setEditingDocumentId] = useState("");
   const [feishuUrl, setFeishuUrl] = useState("");
   const [feishuSecret, setFeishuSecret] = useState("");
-  const [autoMode, setAutoMode] = useState("all_templates");
+  const [autoMode, setAutoMode] = useState("low_risk_templates_only");
   const [selectedQuestionId, setSelectedQuestionId] = useState("");
   const [selectedThreadId, setSelectedThreadId] = useState("");
   const [csvEncoding, setCsvEncoding] = useState<CsvEncoding>("auto");
@@ -170,9 +298,15 @@ export default function AppShell({ apiUrl }: AppShellProps) {
   const [presaleReferences, setPresaleReferences] = useState<AnyRecord[]>([]);
   const [aftersaleReferences, setAftersaleReferences] = useState<AnyRecord[]>([]);
   const [message, setMessage] = useState("");
+  const [apiConnected, setApiConnected] = useState(true);
   const [busy, setBusy] = useState(false);
 
   const metrics = useMemo(() => dashboard?.metrics as AnyRecord | undefined || {}, [dashboard]);
+  const charts = useMemo(() => dashboard?.charts as AnyRecord | undefined || {}, [dashboard]);
+  const categoryChart = useMemo(() => asChart(charts, "categoryBreakdown"), [charts]);
+  const statusChart = useMemo(() => asChart(charts, "statusBreakdown"), [charts]);
+  const handoffChart = useMemo(() => asChart(charts, "handoffBreakdown"), [charts]);
+  const dailyChart = useMemo(() => asList<AnyRecord>(charts, "dailyProcessed"), [charts]);
   const systemStatus = useMemo(() => dashboard?.systemStatus as AnyRecord | undefined || {}, [dashboard]);
   const currentShop = useMemo(() => shops.find((shop) => valueOf(shop, "id") === selectedShop), [shops, selectedShop]);
   const selectedQuestion = useMemo(
@@ -186,7 +320,7 @@ export default function AppShell({ apiUrl }: AppShellProps) {
   const shopQuery = selectedShop ? `?shopId=${encodeURIComponent(selectedShop)}` : "";
 
   async function refresh() {
-    const [nextDashboard, nextShops, nextSkus, nextDocs, nextQuestions, nextThreads, nextTemplates, nextReviews, nextLogs, nextFeishu, nextAutomation] = await Promise.all([
+    const [nextDashboard, nextShops, nextSkus, nextDocs, nextQuestions, nextThreads, nextTemplates, nextReviews, nextFeishu, nextAutomation] = await Promise.all([
       requestJson(apiUrl, `/dashboard${shopQuery}`),
       requestJson(apiUrl, "/shops"),
       requestJson(apiUrl, `/kb/skus${shopQuery}`),
@@ -195,7 +329,6 @@ export default function AppShell({ apiUrl }: AppShellProps) {
       requestJson(apiUrl, `/aftersale/threads${shopQuery}`),
       requestJson(apiUrl, `/reply-templates${shopQuery}`),
       requestJson(apiUrl, `/reply-reviews${shopQuery}`),
-      requestJson(apiUrl, `/operation-logs${shopQuery}`),
       requestJson(apiUrl, `/settings/feishu-webhook${shopQuery}`),
       requestJson(apiUrl, `/settings/automation${shopQuery}`)
     ]);
@@ -207,11 +340,13 @@ export default function AppShell({ apiUrl }: AppShellProps) {
     setThreads(asList(nextThreads, "threads"));
     setTemplates(asList(nextTemplates, "templates"));
     setReviews(asList(nextReviews, "reviews"));
-    setLogs(asList(nextLogs, "logs"));
+    const nextPolicy = nextAutomation.policy && typeof nextAutomation.policy === "object" ? nextAutomation.policy as AnyRecord : null;
     setFeishu(nextFeishu);
-    setAutomation(nextAutomation.policy || null);
-    setAutoMode(String(nextAutomation.policy?.autoReplyMode || "all_templates"));
-    if (!selectedShop && nextDashboard.shop?.id) setSelectedShop(String(nextDashboard.shop.id));
+    setAutomation(nextPolicy);
+    setAutoMode(String(nextPolicy?.autoReplyMode || "low_risk_templates_only"));
+    setApiConnected(true);
+    const nextShop = nextDashboard.shop && typeof nextDashboard.shop === "object" ? nextDashboard.shop as AnyRecord : null;
+    if (!selectedShop && nextShop?.id) setSelectedShop(String(nextShop.id));
     const loadedQuestions = asList(nextQuestions, "questions");
     const loadedThreads = asList(nextThreads, "threads");
     if (!selectedQuestionId && loadedQuestions[0]) setSelectedQuestionId(valueOf(loadedQuestions[0], "id"));
@@ -226,36 +361,125 @@ export default function AppShell({ apiUrl }: AppShellProps) {
       await refresh();
       setMessage(`${label}完成`);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error));
+      const nextMessage = error instanceof Error ? error.message : String(error);
+      if (nextMessage.includes("无法连接客服后端")) setApiConnected(false);
+      setMessage(nextMessage);
     } finally {
       setBusy(false);
     }
   }
 
   useEffect(() => {
-    refresh().catch((error) => setMessage(error instanceof Error ? error.message : String(error)));
+    refresh().catch((error) => {
+      setApiConnected(false);
+      setMessage(error instanceof Error ? error.message : String(error));
+    });
   }, [selectedShop]);
 
   useEffect(() => {
-    setDraftText("");
+    setDraftText(selectedQuestion ? valueOf(selectedQuestion, "finalAnswer") || valueOf(selectedQuestion, "aiDraft") : "");
     setPresaleReferences([]);
   }, [selectedQuestion?.id]);
 
   useEffect(() => {
-    setAftersaleReplyText("");
+    setAftersaleReplyText(selectedThread ? valueOf(selectedThread, "suggestedReply") : "");
     setAftersaleReferences([]);
   }, [selectedThread?.id]);
 
+  async function handleProductFile(file: File) {
+    const extension = extensionOf(file.name);
+    if (!canUseAsProductFile(extension)) throw new Error("商品资料请上传 CSV、TXT 或 Excel 文件");
+    const result = await decodeFile(file, csvEncoding);
+    if (result.kind === "workbook") {
+      setProductFileBase64(result.base64);
+      setProductFileName(result.fileName);
+      setProductFileMimeType(result.mimeType || file.type);
+      setProductText(result.preview);
+      setProductFileInfo({
+        fileName: result.fileName,
+        fileType: fileTypeLabel(extension),
+        mimeType: result.mimeType || file.type,
+        sizeLabel: result.sizeLabel,
+        preview: result.preview
+      });
+      setMessage("Excel 文件已选择，保存后会解析为商品资料");
+      return;
+    }
+
+    setProductFileBase64("");
+    setProductFileName("");
+    setProductFileMimeType("");
+    setProductText(result.text);
+    setProductFileInfo({
+      fileName: file.name,
+      fileType: fileTypeLabel(extension),
+      mimeType: file.type,
+      sizeLabel: formatFileSize(file.size),
+      preview: short(result.text.replace(/\s+/g, " "), 240)
+    });
+    setMessage("文件已读取，请检查预览内容后保存商品资料");
+  }
+
+  async function handleDocumentFile(file: File) {
+    const extension = extensionOf(file.name);
+    if (!canUseAsDocumentFile(extension)) throw new Error("文本资料请上传 TXT、PDF 或 DOCX 文件");
+    const buffer = await file.arrayBuffer();
+    const base64 = arrayBufferToBase64(buffer);
+    const decoded = extension === "txt" ? await decodeFile(file, csvEncoding) : null;
+    const textPreview = decoded?.kind === "text" ? decoded.text : "";
+    setEditingDocumentId("");
+    setDocFileBase64(base64);
+    setDocFileName(file.name);
+    setDocFileMimeType(file.type);
+    if (!docTitle) setDocTitle(titleFromFileName(file.name));
+    if (textPreview) setDocContent(textPreview);
+    setDocFileInfo({
+      fileName: file.name,
+      fileType: fileTypeLabel(extension),
+      mimeType: file.type,
+      sizeLabel: formatFileSize(file.size),
+      preview: textPreview ? short(textPreview.replace(/\s+/g, " "), 240) : "保存后由后端提取文档文字，并生成售前回复依据。"
+    });
+    setMessage(`${fileTypeLabel(extension)} 已选择，保存后会生成售前回复依据`);
+  }
+
+  function titleFromFileName(fileName: string) {
+    return fileName.replace(/\.[^.]+$/, "").trim() || "售前资料";
+  }
+
+  function clearDocumentFile() {
+    setDocFileBase64("");
+    setDocFileName("");
+    setDocFileMimeType("");
+    setDocFileInfo(null);
+  }
+
   async function saveProductKnowledge() {
-    await requestJson(apiUrl, "/kb/skus/import", { method: "POST", body: JSON.stringify({ shopId: selectedShop, csv: productText }) });
+    await requestJson(apiUrl, "/kb/skus/import", {
+      method: "POST",
+      body: JSON.stringify(productFileBase64
+        ? { shopId: selectedShop, fileBase64: productFileBase64, fileName: productFileName, mimeType: productFileMimeType, encoding: csvEncoding }
+        : { shopId: selectedShop, csv: productText, encoding: csvEncoding })
+    });
+    setProductFileBase64("");
+    setProductFileName("");
+    setProductFileMimeType("");
+    setProductFileInfo(null);
+    setProductText("");
   }
 
   async function saveDocument() {
+    const body = docFileBase64 && !editingDocumentId
+      ? { shopId: selectedShop, title: docTitle, docType, sku: docSku, fileBase64: docFileBase64, fileName: docFileName, mimeType: docFileMimeType, encoding: csvEncoding }
+      : { shopId: selectedShop, title: docTitle, docType, sku: docSku, content: docContent };
     await requestJson(apiUrl, editingDocumentId ? `/kb/documents/${editingDocumentId}` : "/kb/documents/import", {
       method: editingDocumentId ? "PATCH" : "POST",
-      body: JSON.stringify({ shopId: selectedShop, title: docTitle, docType, sku: docSku, content: docContent })
+      body: JSON.stringify(body)
     });
     setEditingDocumentId("");
+    setDocTitle("");
+    setDocContent("");
+    clearDocumentFile();
   }
 
   async function searchReferences() {
@@ -272,10 +496,30 @@ export default function AppShell({ apiUrl }: AppShellProps) {
   }
 
   async function saveFeishu() {
-    await requestJson(apiUrl, "/settings/feishu-webhook", {
+    const result = await requestJson(apiUrl, "/settings/feishu-webhook", {
       method: "POST",
       body: JSON.stringify({ shopId: selectedShop, webhookUrl: feishuUrl, secret: feishuSecret, enabled: true, notifyPresale: true, notifyAftersale: true })
     });
+    setFeishu(result);
+    setFeishuUrl("");
+    setFeishuSecret("");
+  }
+
+  async function setFeishuEnabled(enabled: boolean) {
+    const result = await requestJson(apiUrl, "/settings/feishu-webhook", {
+      method: "POST",
+      body: JSON.stringify({ shopId: selectedShop, enabled, notifyPresale: true, notifyAftersale: true })
+    });
+    setFeishu(result);
+  }
+
+  async function deleteFeishu() {
+    if (!window.confirm("删除当前飞书机器人配置？")) return;
+    const result = await requestJson(apiUrl, "/settings/feishu-webhook", {
+      method: "DELETE",
+      body: JSON.stringify({ shopId: selectedShop })
+    });
+    setFeishu(result);
     setFeishuUrl("");
     setFeishuSecret("");
   }
@@ -347,22 +591,6 @@ export default function AppShell({ apiUrl }: AppShellProps) {
     if (buffer.trim()) handleEvent(buffer);
   }
 
-  async function approvePresaleDraft() {
-    if (!selectedQuestion) return;
-    await requestJson(apiUrl, `/presale/questions/${valueOf(selectedQuestion, "id")}/approve`, {
-      method: "POST",
-      body: JSON.stringify({ shopId: selectedShop, answerText: draftText })
-    });
-  }
-
-  async function sendPresaleDryRun() {
-    if (!selectedQuestion) return;
-    await requestJson(apiUrl, `/presale/questions/${valueOf(selectedQuestion, "id")}/send`, {
-      method: "POST",
-      body: JSON.stringify({ shopId: selectedShop, answerText: draftText })
-    });
-  }
-
   async function sendPresaleToMeli() {
     if (!selectedQuestion) return;
     await requestJson(apiUrl, `/presale/questions/${valueOf(selectedQuestion, "id")}/send`, {
@@ -403,6 +631,7 @@ export default function AppShell({ apiUrl }: AppShellProps) {
     setDocType(valueOf(doc, "docType") || "faq");
     setDocContent(valueOf(doc, "content"));
     setDocSku("");
+    clearDocumentFile();
     setTab("knowledge");
   }
 
@@ -419,6 +648,10 @@ export default function AppShell({ apiUrl }: AppShellProps) {
       valueOf(sku, "returnPolicy")
     ].map((cell) => `"${cell.replace(/"/g, '""')}"`);
     setProductText(`sku,itemId,title,sellingPoints,faq,warrantyPolicy,invoicePolicy,shippingNotes,returnPolicy\n${cells.join(",")}`);
+    setProductFileBase64("");
+    setProductFileName("");
+    setProductFileMimeType("");
+    setProductFileInfo(null);
     setTab("knowledge");
   }
 
@@ -437,13 +670,35 @@ export default function AppShell({ apiUrl }: AppShellProps) {
     setAftersaleReferences(asList(result, "ragHits"));
   }
 
-  async function sendAftersaleDryRun() {
+  async function sendAftersaleMessage() {
     if (!selectedThread) return;
-    const replyText = aftersaleReplyText.trim() || valueOf(selectedThread, "suggestedReply");
-    await requestJson(apiUrl, `/aftersale/threads/${valueOf(selectedThread, "id")}/send`, {
+    const threadId = valueOf(selectedThread, "id");
+    const analyzed = await requestJson(apiUrl, `/aftersale/threads/${threadId}/analyze`, {
       method: "POST",
-      body: JSON.stringify({ shopId: selectedShop, replyText })
+      body: JSON.stringify({ shopId: selectedShop, dispatch: true })
     });
+    let thread = selectedThread;
+    const updatedThread = analyzed.thread as AnyRecord | undefined;
+    if (updatedThread?.id) {
+      thread = { ...thread, ...updatedThread };
+      setThreads((current) => current.map((item) => valueOf(item, "id") === valueOf(updatedThread, "id") ? { ...item, ...updatedThread } : item));
+      setSelectedThreadId(valueOf(updatedThread, "id"));
+      setAftersaleReplyText(valueOf(updatedThread, "suggestedReply"));
+    }
+    setAftersaleReferences(asList(analyzed, "ragHits"));
+    if (valueOf(thread, "handoffRequired") === "true") return;
+    const replyText = aftersaleReplyText.trim() || valueOf(thread, "suggestedReply");
+    if (!replyText) throw new Error("没有可发送的售后回复，请先维护对应预设回复。");
+    const sent = await requestJson(apiUrl, `/aftersale/threads/${threadId}/send`, {
+      method: "POST",
+      body: JSON.stringify({ shopId: selectedShop, replyText, dryRun: false })
+    });
+    const sentThread = sent.thread as AnyRecord | undefined;
+    if (sentThread?.id) {
+      setThreads((current) => current.map((item) => valueOf(item, "id") === valueOf(sentThread, "id") ? { ...item, ...sentThread } : item));
+      setSelectedThreadId(valueOf(sentThread, "id"));
+      setAftersaleReplyText("");
+    }
   }
 
   async function deleteAftersaleThread(id: string) {
@@ -454,6 +709,18 @@ export default function AppShell({ apiUrl }: AppShellProps) {
     });
     setSelectedThreadId("");
     setAftersaleReplyText("");
+  }
+
+  async function deleteReviewItem(item: AnyRecord) {
+    const id = valueOf(item, "id");
+    if (!id) return;
+    if (valueOf(item, "targetType") === "presale_question") {
+      await deletePresaleQuestion(id);
+      return;
+    }
+    if (valueOf(item, "targetType") === "aftersale_thread") {
+      await deleteAftersaleThread(id);
+    }
   }
 
   function editTemplate(template: AnyRecord) {
@@ -543,6 +810,11 @@ export default function AppShell({ apiUrl }: AppShellProps) {
           </div>
         </header>
 
+        {!apiConnected ? (
+          <div className="notice warn">
+            后端服务未连接。当前页面可查看和编辑草稿，但保存、同步、匹配测试需要先启动 API 服务。
+          </div>
+        ) : null}
         {message ? <div className={message.endsWith("完成") ? "notice ok" : "notice warn"}>{message}</div> : null}
 
         {tab === "today" && (
@@ -556,8 +828,6 @@ export default function AppShell({ apiUrl }: AppShellProps) {
               <div><span>建议采纳率</span><strong>{String(metrics.adoptionRate ?? 0)}%</strong></div>
             </div>
             <div className="quick-actions">
-              <button disabled={busy} onClick={() => run("模拟售前咨询", simulatePresaleQuestion)}>模拟售前咨询</button>
-              <button disabled={busy} onClick={() => run("模拟售后消息", simulateAftersaleMessage)}>模拟售后消息</button>
               <button onClick={() => setTab("consultations")}>处理买家咨询</button>
               <button onClick={() => setTab("aftersale")}>处理售后问题</button>
               <button onClick={() => setTab("knowledge")}>上传知识库</button>
@@ -586,7 +856,6 @@ export default function AppShell({ apiUrl }: AppShellProps) {
             <aside className="queue-panel">
               <h2>咨询队列</h2>
               <div className="mini-tabs"><button>全部</button><button>待处理</button><button>待审核</button><button>高风险</button></div>
-              <button className="queue-action" disabled={busy} onClick={() => run("批量采纳低风险草稿", () => requestJson(apiUrl, "/presale/questions/bulk-approve", { method: "POST", body: JSON.stringify({ shopId: selectedShop }) }))}>批量采纳低风险草稿</button>
               <div className="queue-list">
                 {questions.map((question) => (
                   <button
@@ -603,13 +872,26 @@ export default function AppShell({ apiUrl }: AppShellProps) {
               </div>
             </aside>
             <article className="detail-panel">
-              <h2>买家问题与商品信息</h2>
+              <h2>售前对话闭环</h2>
               {selectedQuestion ? (
                 <>
-                  <div className="message-card">{valueOf(selectedQuestion, "questionText") || "-"}</div>
                   <div className="columns">
                     <div className="label-block"><span>商品编号</span><strong>{valueOf(selectedQuestion, "itemId")}</strong></div>
                     <div className="label-block"><span>状态</span><strong>{statusText(valueOf(selectedQuestion, "questionStatus"))}</strong></div>
+                  </div>
+                  <div className="conversation-stream">
+                    <div className="bubble customer">
+                      <div className="bubble-head"><span>买家消息</span>{valueOf(selectedQuestion, "createdAt") ? <em>{displayDateTime(valueOf(selectedQuestion, "createdAt"))}</em> : null}</div>
+                      <p>{valueOf(selectedQuestion, "questionText") || "-"}</p>
+                    </div>
+                    {valueOf(selectedQuestion, "finalAnswer") || valueOf(selectedQuestion, "aiDraft") ? (
+                      <div className={`bubble assistant ${valueOf(selectedQuestion, "finalAnswer") ? "sent" : "draft"}`}>
+                        <div className="bubble-head"><span>{presaleReplyLabel(selectedQuestion)}</span>{valueOf(selectedQuestion, "sentAt") ? <em>{displayDateTime(valueOf(selectedQuestion, "sentAt"))}</em> : null}</div>
+                        <p>{valueOf(selectedQuestion, "finalAnswer") || valueOf(selectedQuestion, "aiDraft")}</p>
+                      </div>
+                    ) : (
+                      <div className="bubble system"><p>还没有生成或记录回复。右侧生成草稿后，可在这里核对买家问题与回复内容是否闭环。</p></div>
+                    )}
                   </div>
                   <h3>已上传商品资料</h3>
                   {skus.slice(0, 3).map((sku) => <div className="info-card" key={valueOf(sku, "id")}><strong>SKU：{valueOf(sku, "sku")}</strong><p>{valueOf(sku, "title")}</p></div>)}
@@ -617,7 +899,11 @@ export default function AppShell({ apiUrl }: AppShellProps) {
               ) : <div className="empty-state">先初始化演示数据，或等待平台同步咨询</div>}
             </article>
             <aside className="assist-panel">
-              <h2>售前 AI 回复</h2>
+              <h2>编辑回复</h2>
+              <div className="reply-status">
+                <strong>{selectedQuestion ? presaleReplyLabel(selectedQuestion) || "待生成回复" : "未选择咨询"}</strong>
+                <span>{selectedQuestion ? statusText(valueOf(selectedQuestion, "reviewStatus")) : "-"}</span>
+              </div>
               <textarea className="reply-box" value={draftText} onChange={(event) => setDraftText(event.target.value)} placeholder="点击“生成 AI 草稿”后，这里会出现可审核、可编辑的回复。" />
               <h3>本次参考资料</h3>
               <ul className="plain-list">
@@ -633,12 +919,10 @@ export default function AppShell({ apiUrl }: AppShellProps) {
                 <div className="action-group">
                   <span>草稿处理</span>
                   <button disabled={!selectedQuestion || busy} onClick={() => run("生成 AI 草稿", generatePresaleDraft)}>生成 AI 草稿</button>
-                  <button disabled={!selectedQuestion || busy || !draftText.trim()} onClick={() => run("采纳为回复", approvePresaleDraft)}>采纳为回复</button>
                 </div>
                 <div className="action-group">
                   <span>发送</span>
-                  <button disabled={!selectedQuestion || busy || !draftText.trim()} onClick={() => run("模拟发送", sendPresaleDryRun)}>模拟发送</button>
-                  <button disabled={!selectedQuestion || busy || !draftText.trim()} onClick={() => run("正式发送到平台", sendPresaleToMeli)}>正式发送到平台</button>
+                  <button disabled={!selectedQuestion || busy || !draftText.trim()} onClick={() => run("发送到平台", sendPresaleToMeli)}>发送到平台</button>
                   <button disabled={!selectedQuestion || busy} onClick={() => run("删除咨询", () => deletePresaleQuestion(valueOf(selectedQuestion, "id")))}>删除咨询</button>
                 </div>
               </div>
@@ -659,42 +943,63 @@ export default function AppShell({ apiUrl }: AppShellProps) {
                     onClick={() => setSelectedThreadId(valueOf(thread, "id"))}
                   >
                     <strong>订单 {valueOf(thread, "orderId") || valueOf(thread, "packId")}</strong>
-                    <span>{statusText(valueOf(thread, "category"))}</span>
-                    <em>{statusText(valueOf(thread, "status"))} · 风险 {statusText(valueOf(thread, "riskLevel"))}</em>
+                    <span>{valueOf(thread, "handoffLabel") || statusText(valueOf(thread, "category"))}</span>
+                    <em>{statusText(valueOf(thread, "status"))} · 风险 {statusText(valueOf(thread, "riskLevel"))} · {String(valueOf(thread, "messageCount") || asList(thread, "messages").length)} 条消息</em>
                   </button>
                 ))}
                 {!threads.length ? <div className="empty-state">暂无售后工单</div> : null}
               </div>
             </aside>
             <article className="detail-panel">
-              <h2>买家消息 / 订单 / 物流</h2>
+              <h2>售后对话闭环</h2>
               {selectedThread ? (
                 <>
                   <div className="columns">
                     <div className="label-block"><span>包裹号</span><strong>{valueOf(selectedThread, "packId")}</strong></div>
                     <div className="label-block"><span>订单号</span><strong>{valueOf(selectedThread, "orderId") || "-"}</strong></div>
                   </div>
-                  {(asList(selectedThread, "messages")).map((msg) => <div className="message-card" key={valueOf(msg, "id")}>{valueOf(msg, "text")}</div>)}
+                  {valueOf(selectedThread, "handoffRequired") === "true" ? <div className="handoff-banner">{valueOf(selectedThread, "handoffLabel") || "人工待处理"}</div> : null}
+                  <div className="conversation-stream">
+                    {(asList(selectedThread, "messages")).map((msg) => {
+                      const record = msg as AnyRecord;
+                      const role = messageRole(record);
+                      return (
+                        <div className={`bubble ${role}`} key={valueOf(record, "id")}>
+                          <div className="bubble-head"><span>{messageRoleText(role)}</span>{valueOf(record, "messageDate") ? <em>{displayDateTime(valueOf(record, "messageDate"))}</em> : null}</div>
+                          <p>{valueOf(record, "text") || "-"}</p>
+                        </div>
+                      );
+                    })}
+                    {!asList(selectedThread, "messages").some((msg) => messageRole(msg as AnyRecord) === "assistant") && valueOf(selectedThread, "suggestedReply") ? (
+                      <div className="bubble assistant draft">
+                        <div className="bubble-head"><span>待记录回复</span></div>
+                        <p>{valueOf(selectedThread, "suggestedReply")}</p>
+                      </div>
+                    ) : null}
+                  </div>
                 </>
               ) : <div className="empty-state">暂无售后消息</div>}
             </article>
             <aside className="assist-panel">
-              <h2>自动识别与兜底回复</h2>
+              <h2>售后自动回复</h2>
+              <div className="reply-status">
+                <strong>{valueOf(selectedThread, "handoffLabel") || statusText(valueOf(selectedThread, "category"))}</strong>
+                <span>{selectedThread ? `${statusText(valueOf(selectedThread, "status"))} · ${String(valueOf(selectedThread, "messageCount") || asList(selectedThread, "messages").length)} 条消息` : "-"}</span>
+              </div>
               <div className="info-card"><strong>问题类型：{statusText(valueOf(selectedThread, "category"))}</strong><p>{valueOf(selectedThread, "suggestedAction") || "售后消息进入后会自动识别意图并路由到预设回复。"}</p></div>
               {valueOf(selectedThread, "suggestedReply") ? <div className="info-card"><strong>已路由预设回复</strong><p>{valueOf(selectedThread, "suggestedReply")}</p></div> : null}
-              <textarea className="reply-box" value={aftersaleReplyText} onChange={(event) => setAftersaleReplyText(event.target.value)} placeholder="如需覆盖自动回复，在这里输入自定义内容；留空则使用上方已路由预设回复。" />
+              <textarea className="reply-box" value={aftersaleReplyText} onChange={(event) => setAftersaleReplyText(event.target.value)} placeholder="发送前可编辑本次发送内容；开票和转人工场景会改为飞书提醒。" />
               <h3>处理依据</h3>
               <ul className="plain-list">
-                <li>售后分析不调用售前 RAG 知识库，优先使用订单上下文、风险规则和预设回复自动兜底。</li>
+                <li>售后分析不使用售前回复依据，优先使用订单上下文、风险规则和预设回复。</li>
                 {valueOf(selectedThread, "category") ? <li>当前分类：{statusText(valueOf(selectedThread, "category"))}</li> : null}
                 {valueOf(selectedThread, "category") === "human_request" ? <li>买家明确要求转人工，系统会先自动安抚并通过飞书提醒售后客服。</li> : null}
+                {valueOf(selectedThread, "category") === "invoice_request" ? <li>开票问题会先收集必要开票资料，同时通过飞书提醒人工处理。</li> : null}
+                {valueOf(selectedThread, "category") === "other" ? <li>未识别问题不自动回复，通过飞书提醒人工处理。</li> : null}
+                {valueOf(selectedThread, "category") && !["human_request", "invoice_request", "other"].includes(valueOf(selectedThread, "category")) ? <li>该类型按预设回复自动处理，不额外转人工。</li> : null}
               </ul>
               <div className="button-row">
-                <button disabled={!selectedThread || busy} onClick={() => run("售后分析", analyzeAftersaleThread)}>识别并自动路由</button>
-                <button disabled={!selectedThread || busy || !valueOf(selectedThread, "suggestedReply")} onClick={() => setAftersaleReplyText(valueOf(selectedThread, "suggestedReply"))}>采用推荐编辑</button>
-                <button disabled={!selectedThread || busy || !(aftersaleReplyText.trim() || valueOf(selectedThread, "suggestedReply"))} onClick={() => run("记录自动回复", sendAftersaleDryRun)}>记录自动回复</button>
-                <button disabled={!selectedThread || busy} onClick={() => run("关闭售后", () => requestJson(apiUrl, `/aftersale/threads/${valueOf(selectedThread, "id")}/close`, { method: "POST", body: JSON.stringify({ shopId: selectedShop }) }))}>关闭</button>
-                <button disabled={!selectedThread || busy} onClick={() => run("删除售后", () => deleteAftersaleThread(valueOf(selectedThread, "id")))}>删除</button>
+                <button disabled={!selectedThread || busy} onClick={() => run("发送售后信息", sendAftersaleMessage)}>发送信息</button>
               </div>
             </aside>
           </section>
@@ -703,7 +1008,7 @@ export default function AppShell({ apiUrl }: AppShellProps) {
         {tab === "reviews" && (
           <section className="table-wrap">
             <table>
-              <thead><tr><th>来源</th><th>买家问题</th><th>推荐回复</th><th>风险</th><th>状态</th><th>参考资料</th></tr></thead>
+              <thead><tr><th>来源</th><th>买家问题</th><th>推荐回复</th><th>风险</th><th>状态</th><th>参考资料</th><th>操作</th></tr></thead>
               <tbody>
                 {reviews.map((item) => (
                   <tr key={`${valueOf(item, "source")}-${valueOf(item, "id")}`}>
@@ -713,8 +1018,10 @@ export default function AppShell({ apiUrl }: AppShellProps) {
                     <td><span className={`pill ${valueOf(item, "riskLevel")}`}>{statusText(valueOf(item, "riskLevel"))}</span></td>
                     <td>{statusText(valueOf(item, "status"))}</td>
                     <td>{Array.isArray(item.references) ? item.references.join(" / ") : "-"}</td>
+                    <td><button disabled={busy} onClick={() => run("删除审核项", () => deleteReviewItem(item))}>删除</button></td>
                   </tr>
                 ))}
+                {!reviews.length ? <tr><td colSpan={7}>暂无待审核信息</td></tr> : null}
               </tbody>
             </table>
           </section>
@@ -722,9 +1029,17 @@ export default function AppShell({ apiUrl }: AppShellProps) {
 
         {tab === "knowledge" && (
           <section className="knowledge-layout">
-            <article>
+            <article
+              className="upload-card"
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={(event) => {
+                event.preventDefault();
+                const file = event.dataTransfer.files?.[0];
+                if (file) handleProductFile(file).catch((error) => setMessage(error instanceof Error ? error.message : String(error)));
+              }}
+            >
               <h2>售前商品资料</h2>
-              <p className="muted">用于买家咨询的 AI 回复。支持 CSV 文本粘贴，字段可包含 SKU、商品名称、发票规则、保修政策、物流说明和退换货规则。</p>
+              <p className="muted">用于买家咨询的建议回复。可拖入 CSV、TXT 或 Excel，字段可包含 SKU、商品名称、发票规则、保修政策、物流说明和退换货规则。</p>
               <div className="toolbar">
                 <select value={csvEncoding} onChange={(event) => setCsvEncoding(event.target.value as CsvEncoding)} title="CSV 文件编码">
                   <option value="auto">自动识别编码</option>
@@ -733,24 +1048,34 @@ export default function AppShell({ apiUrl }: AppShellProps) {
                   <option value="utf-16le">UTF-16 LE</option>
                   <option value="big5">Big5</option>
                 </select>
-                <input type="file" accept=".csv,.txt,text/csv,text/plain" onChange={(event) => {
+                <input aria-label="上传商品资料文件" type="file" accept=".csv,.txt,.xlsx,.xls,text/csv,text/plain,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" onChange={(event) => {
                   const file = event.target.files?.[0];
                   if (file) {
-                    decodeFile(file, csvEncoding)
-                      .then((text) => {
-                        setProductText(text);
-                        setMessage("文件已读取，请检查预览内容后保存商品资料");
-                      })
-                      .catch((error) => setMessage(error instanceof Error ? error.message : String(error)));
+                    handleProductFile(file).catch((error) => setMessage(error instanceof Error ? error.message : String(error)));
                   }
                 }} />
               </div>
-              <textarea value={productText} onChange={(event) => setProductText(event.target.value)} placeholder="粘贴或上传 CSV。字段示例：sku,itemId,title,sellingPoints,faq,warrantyPolicy,invoicePolicy,shippingNotes,returnPolicy" />
-              <button disabled={busy} onClick={() => run("商品资料保存", saveProductKnowledge)}>保存商品资料</button>
+              {productFileInfo ? (
+                <div className="file-summary">
+                  <strong>{productFileInfo.fileName}</strong>
+                  <span>{productFileInfo.fileType} · {productFileInfo.sizeLabel}</span>
+                  <p>{productFileInfo.preview}</p>
+                </div>
+              ) : <div className="drop-hint">拖入商品资料文件，或直接粘贴表格内容。</div>}
+              <textarea value={productText} onChange={(event) => { setProductText(event.target.value); setProductFileBase64(""); setProductFileName(""); setProductFileMimeType(""); setProductFileInfo(null); }} placeholder="粘贴或上传 CSV / Excel。字段示例：SKU,DESCRIPTION 或 sku,itemId,title,sellingPoints,faq,warrantyPolicy,invoicePolicy,shippingNotes,returnPolicy" />
+              <button disabled={busy || (!productText.trim() && !productFileBase64)} onClick={() => run("商品资料保存", saveProductKnowledge)}>保存商品资料</button>
             </article>
-            <article>
+            <article
+              className="upload-card"
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={(event) => {
+                event.preventDefault();
+                const file = event.dataTransfer.files?.[0];
+                if (file) handleDocumentFile(file).catch((error) => setMessage(error instanceof Error ? error.message : String(error)));
+              }}
+            >
               <h2>售前文本资料</h2>
-              <p className="muted">只参与售前 AI 回复检索，不参与售后工单分析。售后请使用预设回复和人工处理流程。</p>
+              <p className="muted">只参与买家咨询的回复依据，不参与售后工单分析。支持 TXT、PDF、DOCX；PDF 和 Word 保存后由后端提取文字。</p>
               <div className="form-grid">
                 <input value={docTitle} onChange={(event) => setDocTitle(event.target.value)} placeholder="资料名称" />
                 <select value={docType} onChange={(event) => setDocType(event.target.value)}>
@@ -758,17 +1083,39 @@ export default function AppShell({ apiUrl }: AppShellProps) {
                 </select>
                 <input value={docSku} onChange={(event) => setDocSku(event.target.value)} placeholder="关联 SKU" />
               </div>
-              <textarea value={docContent} onChange={(event) => setDocContent(event.target.value)} placeholder="输入售前文本资料内容。该内容只参与售前 RAG 检索，不参与售后回复。" />
-              <button disabled={busy} onClick={() => run(editingDocumentId ? "文本资料更新" : "文本资料保存", saveDocument)}>{editingDocumentId ? "更新文本资料" : "保存文本资料"}</button>
-              {editingDocumentId ? <button disabled={busy} onClick={() => { setEditingDocumentId(""); setDocTitle(""); setDocContent(""); }}>取消编辑</button> : null}
+              <input aria-label="上传文本资料文件" type="file" accept=".txt,.pdf,.docx,text/plain,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) handleDocumentFile(file).catch((error) => setMessage(error instanceof Error ? error.message : String(error)));
+              }} />
+              {docFileInfo ? (
+                <div className="file-summary">
+                  <strong>{docFileInfo.fileName}</strong>
+                  <span>{docFileInfo.fileType} · {docFileInfo.sizeLabel}</span>
+                  <p>{docFileInfo.preview}</p>
+                </div>
+              ) : <div className="drop-hint">拖入文本资料文件，或直接输入内容。</div>}
+              <textarea value={docContent} onChange={(event) => { setDocContent(event.target.value); clearDocumentFile(); }} placeholder="输入售前文本资料内容。该内容只参与买家咨询的回复依据，不参与售后回复。" />
+              <button disabled={busy || (!docContent.trim() && !docFileBase64)} onClick={() => run(editingDocumentId ? "文本资料更新" : "文本资料保存", saveDocument)}>{editingDocumentId ? "更新文本资料" : "保存文本资料"}</button>
+              {editingDocumentId ? <button disabled={busy} onClick={() => { setEditingDocumentId(""); setDocTitle(""); setDocContent(""); clearDocumentFile(); }}>取消编辑</button> : null}
             </article>
             <article>
               <h2>售前匹配测试</h2>
-              <p className="muted">输入买家咨询，检查 AI 回复前会命中的商品资料和文本资料。</p>
+              <p className="muted">输入买家咨询，检查生成建议回复前会参考哪些商品资料和文本资料。</p>
               <textarea value={referenceQuery} onChange={(event) => setReferenceQuery(event.target.value)} placeholder="输入一条买家售前咨询，用来测试会命中哪些知识库资料。" />
-              <button disabled={busy} onClick={() => run("参考资料匹配", searchReferences)}>查看匹配结果</button>
+              <button disabled={busy || !referenceQuery.trim()} onClick={() => run("参考资料匹配", searchReferences)}>查看匹配结果</button>
               <div className="hit-list">
-                {referenceHits.map((hit) => <div className="hit" key={valueOf(hit, "id")}><strong>{valueOf(hit, "title")} · 匹配度 {matchText(valueOf(hit, "score"))}</strong><p>{short(valueOf(hit, "content"), 180)}</p></div>)}
+                {referenceHits.map((hit) => {
+                  const metadata = hit.metadata as AnyRecord | undefined;
+                  const skuTags = Array.isArray(metadata?.sku_tags) ? metadata.sku_tags.join(", ") : "";
+                  return (
+                    <div className="hit" key={valueOf(hit, "id")}>
+                      <strong>{valueOf(hit, "title")} · 匹配度 {matchText(valueOf(hit, "score"))}</strong>
+                      <span>资料类型：{docTypeText(valueOf(hit, "docType"))}{skuTags ? ` · 关联 SKU：${skuTags}` : ""}</span>
+                      <p>{short(valueOf(hit, "content"), 220)}</p>
+                    </div>
+                  );
+                })}
+                {!referenceHits.length ? <div className="empty-state compact">暂无匹配结果。请先保存资料，或换一个更接近买家原话的问题测试。</div> : null}
               </div>
             </article>
             <section className="table-wrap full">
@@ -833,9 +1180,60 @@ export default function AppShell({ apiUrl }: AppShellProps) {
         )}
 
         {tab === "stats" && (
-          <section className="columns">
-            <article><h2>处理统计</h2><div className="stat-list"><div>今日已回复：{String(metrics.todayReplied ?? 0)}</div><div>建议采纳率：{String(metrics.adoptionRate ?? 0)}%</div><div>高风险售后：{String(metrics.highRisk ?? 0)}</div><div>可用预设回复：{String(metrics.templateCount ?? 0)}</div></div></article>
-            <article><h2>操作记录</h2><div className="timeline">{logs.slice(0, 10).map((log) => <div key={valueOf(log, "id")}><strong>{valueOf(log, "action")}</strong><span>{valueOf(log, "createdAt").slice(0, 19).replace("T", " ")}</span></div>)}</div></article>
+          <section className="stats-layout">
+            <article className="full">
+              <h2>处理统计</h2>
+              <div className="stat-cards">
+                <div><span>今日已回复</span><strong>{String(metrics.todayReplied ?? 0)}</strong></div>
+                <div><span>建议采纳率</span><strong>{String(metrics.adoptionRate ?? 0)}%</strong></div>
+                <div><span>人工待处理</span><strong>{String(metrics.humanPending ?? 0)}</strong></div>
+                <div><span>开票待人工</span><strong>{String(metrics.invoiceHandoff ?? 0)}</strong></div>
+                <div><span>高风险售后</span><strong>{String(metrics.highRisk ?? 0)}</strong></div>
+                <div><span>可用预设回复</span><strong>{String(metrics.templateCount ?? 0)}</strong></div>
+              </div>
+            </article>
+            <article>
+              <h2>售后问题分布</h2>
+              <div className="bar-list">
+                {categoryChart.map((item) => {
+                  const max = chartMax(categoryChart);
+                  return <div className="bar-row" key={valueOf(item, "key")}><span>{valueOf(item, "label")}</span><div><i style={{ width: percentOf(valueOf(item, "value"), max) }} /></div><strong>{valueOf(item, "value")}</strong></div>;
+                })}
+                {!categoryChart.length ? <div className="empty-state compact">暂无售后分类数据</div> : null}
+              </div>
+            </article>
+            <article>
+              <h2>处理状态</h2>
+              <div className="bar-list">
+                {statusChart.map((item) => {
+                  const max = chartMax(statusChart);
+                  return <div className="bar-row" key={valueOf(item, "key")}><span>{valueOf(item, "label")}</span><div><i style={{ width: percentOf(valueOf(item, "value"), max) }} /></div><strong>{valueOf(item, "value")}</strong></div>;
+                })}
+                {!statusChart.length ? <div className="empty-state compact">暂无状态数据</div> : null}
+              </div>
+            </article>
+            <article>
+              <h2>转人工原因</h2>
+              <div className="bar-list">
+                {handoffChart.map((item) => {
+                  const max = chartMax(handoffChart);
+                  return <div className="bar-row" key={valueOf(item, "key")}><span>{valueOf(item, "label")}</span><div><i style={{ width: percentOf(valueOf(item, "value"), max) }} /></div><strong>{valueOf(item, "value")}</strong></div>;
+                })}
+                {!handoffChart.length ? <div className="empty-state compact">暂无转人工事项</div> : null}
+              </div>
+            </article>
+            <article>
+              <h2>近 7 天处理量</h2>
+              <div className="mini-chart">
+                {dailyChart.map((item) => (
+                  <div key={valueOf(item, "date")}>
+                    <span style={{ height: percentOf(valueOf(item, "value"), chartMax(dailyChart)) }} />
+                    <strong>{valueOf(item, "value")}</strong>
+                    <em>{valueOf(item, "date").slice(5)}</em>
+                  </div>
+                ))}
+              </div>
+            </article>
           </section>
         )}
 
@@ -849,24 +1247,33 @@ export default function AppShell({ apiUrl }: AppShellProps) {
             </article>
             <article>
               <h2>飞书提醒</h2>
-              <p className="muted">填写群机器人地址后，售前通知和售后转人工请求会推送到飞书。</p>
+              <p className="muted">配置保存在后端数据库。开票和买家明确要求人工时，会推送到飞书。</p>
+              <div className="info-card">
+                <strong>{feishu?.configured ? `已保存：${valueOf(feishu, "webhookUrlMasked") || "机器人地址已加密保存"}` : "未配置飞书机器人"}</strong>
+                <p>{feishu?.configured && feishu?.decryptable === false ? "当前 TOKEN_ENCRYPTION_KEY 无法解密已保存配置，请重新保存机器人地址。" : feishu?.enabled ? "当前已启用" : "当前未启用"}</p>
+              </div>
               <input value={feishuUrl} onChange={(event) => setFeishuUrl(event.target.value)} placeholder={valueOf(feishu, "webhookUrlMasked") || "飞书机器人地址"} />
               <input value={feishuSecret} onChange={(event) => setFeishuSecret(event.target.value)} placeholder={feishu?.secretConfigured ? "签名密钥已保存，留空不改" : "签名密钥（可选）"} />
               <div className="button-row">
                 <button disabled={busy} onClick={() => run("飞书配置保存", saveFeishu)}>保存</button>
-                <button disabled={busy} onClick={() => run("飞书测试", () => requestJson(apiUrl, "/settings/feishu-webhook/test", { method: "POST", body: JSON.stringify({ shopId: selectedShop }) }))}>发送测试消息</button>
+                <button disabled={busy || !feishu?.configured || feishu?.decryptable === false} onClick={() => run(feishu?.enabled ? "飞书停用" : "飞书启用", () => setFeishuEnabled(!feishu?.enabled))}>{feishu?.enabled ? "停用" : "启用"}</button>
+                <button disabled={busy || !feishu?.enabled} onClick={() => run("飞书测试", () => requestJson(apiUrl, "/settings/feishu-webhook/test", { method: "POST", body: JSON.stringify({ shopId: selectedShop }) }))}>发送测试消息</button>
+                <button disabled={busy || !feishu?.configured} onClick={() => run("飞书配置删除", deleteFeishu)}>删除配置</button>
               </div>
             </article>
             <article>
               <h2>客服助手设置</h2>
-              <p className="muted">售后默认全自动兜底：先识别意图，再路由到预设回复。只有买家明确要求转人工时提醒客服。</p>
+              <p className="muted">售后建议先按风险分级处理。低风险可自动使用预设回复，高风险建议进入人工复核。</p>
               <select value={autoMode} onChange={(event) => setAutoMode(event.target.value)}>
-                <option value="all_templates">售后全部按预设自动兜底</option>
                 <option value="low_risk_templates_only">仅低风险自动处理</option>
+                <option value="all_templates">全部按预设回复处理</option>
                 <option value="off">关闭自动处理</option>
               </select>
               <button disabled={busy} onClick={() => run("客服助手设置保存", saveAutomation)}>保存设置</button>
-              <div className="info-card"><strong>当前模式：{automation?.autoReplyMode === "off" ? "关闭自动处理" : "已开启售后自动兜底"}</strong><p>高风险售后也会自动回复；转人工意图会额外推送飞书。</p></div>
+              <div className="info-card">
+                <strong>当前模式：{automation?.autoReplyMode === "off" ? "关闭自动处理" : automation?.autoReplyMode === "all_templates" ? "全部按预设回复处理" : "仅低风险自动处理"}</strong>
+                <p>{automation?.autoReplyMode === "all_templates" ? "请确认预设回复和人工复核规则已经成熟，再用于真实发送。" : "高风险售后会保留人工复核空间，转人工意图可额外推送飞书。"}</p>
+              </div>
             </article>
           </section>
         )}

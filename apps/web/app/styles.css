@@ -28,6 +28,12 @@ button {
   background: #fff;
   color: #172033;
   cursor: pointer;
+  transition: border-color .15s ease, background .15s ease, box-shadow .15s ease, transform .15s ease;
+}
+
+button:hover:not(:disabled) {
+  border-color: #8fb3ee;
+  box-shadow: 0 4px 14px rgba(34, 62, 105, .08);
 }
 
 button:disabled {
@@ -99,7 +105,7 @@ button:disabled {
 
 .workspace {
   min-width: 0;
-  padding: 18px;
+  padding: 20px;
 }
 
 .topbar {
@@ -322,6 +328,11 @@ article,
   padding: 14px;
 }
 
+.upload-card {
+  display: flex;
+  flex-direction: column;
+}
+
 .mini-tabs {
   display: flex;
   gap: 6px;
@@ -344,8 +355,17 @@ article,
   display: grid;
   gap: 5px;
   width: 100%;
-  padding: 10px;
+  padding: 12px;
   text-align: left;
+  line-height: 1.35;
+}
+
+.queue-card:hover {
+  background: #fbfdff;
+}
+
+.queue-card strong {
+  color: #12213a;
 }
 
 .queue-card.active {
@@ -377,7 +397,6 @@ article,
 }
 
 .info-card,
-.message-card,
 .hit {
   margin-top: 10px;
   padding: 11px;
@@ -386,16 +405,158 @@ article,
   background: #f8fafd;
 }
 
+.conversation-stream {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid #e5edf6;
+  border-radius: 8px;
+  background: linear-gradient(180deg, #fbfdff 0%, #f6f9fd 100%);
+}
+
+.bubble {
+  max-width: 88%;
+  padding: 12px 13px;
+  border: 1px solid #dfe7f0;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 6px 20px rgba(34, 62, 105, .06);
+}
+
+.bubble p {
+  margin: 6px 0 0;
+  color: #24324a;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.bubble-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: #66768c;
+  font-size: 12px;
+}
+
+.bubble-head span {
+  color: #34445b;
+  font-weight: 700;
+}
+
+.bubble-head em {
+  font-style: normal;
+  white-space: nowrap;
+}
+
+.bubble.customer {
+  justify-self: start;
+  border-color: #cfe1ff;
+  background: #eef6ff;
+}
+
+.bubble.assistant {
+  justify-self: end;
+  border-color: #c9e9d8;
+  background: #f0fbf5;
+}
+
+.bubble.assistant.draft {
+  border-color: #ffe1ad;
+  background: #fff8ed;
+}
+
+.bubble.assistant.sent {
+  border-color: #9fdcb8;
+}
+
+.bubble.system {
+  max-width: 100%;
+  justify-self: center;
+  border-color: #e7dde7;
+  background: #fbf7fb;
+  box-shadow: none;
+}
+
+.reply-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 10px;
+  padding: 10px 11px;
+  border: 1px solid #e1e8f2;
+  border-radius: 6px;
+  background: #fbfdff;
+}
+
+.reply-status strong,
+.reply-status span {
+  min-width: 0;
+}
+
+.reply-status span {
+  color: #66768c;
+  font-size: 12px;
+  text-align: right;
+}
+
+.handoff-banner {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid #ffd7a8;
+  border-radius: 6px;
+  background: #fff8ed;
+  color: #9b4b08;
+  font-weight: 700;
+}
+
 .info-card p,
 .hit p {
   margin: 7px 0 0;
   color: #4d5d72;
 }
 
+.hit span {
+  display: block;
+  margin-top: 6px;
+  color: #66768c;
+  font-size: 12px;
+}
+
+.file-summary,
+.drop-hint {
+  margin-top: 10px;
+  padding: 11px;
+  border: 1px dashed #b8c7da;
+  border-radius: 6px;
+  background: #fbfdff;
+}
+
+.file-summary {
+  display: grid;
+  gap: 4px;
+  border-style: solid;
+}
+
+.file-summary span,
+.file-summary p,
+.drop-hint {
+  color: #66768c;
+  font-size: 13px;
+}
+
+.file-summary p {
+  margin: 4px 0 0;
+  line-height: 1.45;
+}
+
 .reply-box {
   min-height: 180px;
   margin-top: 12px;
   background: #fbfdff;
+  line-height: 1.55;
 }
 
 .plain-list {
@@ -420,10 +581,119 @@ article,
   color: #7b8798;
 }
 
+.empty-state.compact {
+  min-height: 86px;
+  padding: 12px;
+  text-align: center;
+}
+
 .columns {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 14px;
+}
+
+.stats-layout {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.stat-cards {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.stat-cards div {
+  padding: 12px;
+  border: 1px solid #e1e8f2;
+  border-radius: 6px;
+  background: #f8fafd;
+}
+
+.stat-cards span {
+  display: block;
+  color: #66768c;
+  font-size: 12px;
+}
+
+.stat-cards strong {
+  display: block;
+  margin-top: 6px;
+  font-size: 24px;
+}
+
+.bar-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.bar-row {
+  display: grid;
+  grid-template-columns: minmax(86px, 130px) minmax(0, 1fr) 36px;
+  gap: 10px;
+  align-items: center;
+}
+
+.bar-row span {
+  color: #4d5d72;
+  font-size: 13px;
+}
+
+.bar-row div {
+  height: 10px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #eef2f7;
+}
+
+.bar-row i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #2f6fed;
+}
+
+.bar-row strong {
+  text-align: right;
+}
+
+.mini-chart {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 10px;
+  align-items: end;
+  min-height: 190px;
+  margin-top: 12px;
+  padding-top: 12px;
+}
+
+.mini-chart div {
+  display: grid;
+  grid-template-rows: 120px 22px 18px;
+  gap: 4px;
+  align-items: end;
+  text-align: center;
+}
+
+.mini-chart span {
+  display: block;
+  min-height: 0;
+  border-radius: 6px 6px 0 0;
+  background: #16a66a;
+}
+
+.mini-chart strong {
+  font-size: 13px;
+}
+
+.mini-chart em {
+  color: #66768c;
+  font-size: 11px;
+  font-style: normal;
 }
 
 .split {
@@ -434,7 +704,7 @@ article,
 
 .knowledge-layout {
   display: grid;
-  grid-template-columns: minmax(360px, .9fr) minmax(360px, .9fr) minmax(320px, .7fr);
+  grid-template-columns: minmax(280px, .9fr) minmax(280px, .9fr) minmax(280px, .7fr);
   gap: 14px;
 }
 
@@ -567,11 +837,13 @@ td button {
   .workbench.three,
   .knowledge-layout,
   .columns,
+  .stats-layout,
   .split {
     grid-template-columns: 1fr;
   }
 
-  .metric-grid {
+  .metric-grid,
+  .stat-cards {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }
@@ -593,7 +865,12 @@ td button {
     margin-top: 12px;
   }
 
-  .metric-grid {
+  .metric-grid,
+  .stat-cards {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .bar-row {
+    grid-template-columns: minmax(72px, 110px) minmax(0, 1fr) 30px;
   }
 }

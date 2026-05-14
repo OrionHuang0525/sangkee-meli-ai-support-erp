@@ -1,6 +1,9 @@
 import crypto from "node:crypto";
 import cors from "cors";
 import express from "express";
+import mammoth from "mammoth";
+import { PDFParse } from "pdf-parse";
+import * as XLSX from "xlsx";
 import { Queue } from "bullmq";
 import { Redis } from "ioredis";
 import { Prisma, prisma } from "@meli-ai-support/db";
@@ -25,6 +28,7 @@ const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
 const MELI_AUTH_URL = process.env.MELI_AUTH_URL || "https://global-selling.mercadolibre.com/authorization";
 const MELI_TOKEN_URL = "https://api.mercadolibre.com/oauth/token";
 const DEMO_SELLER_ID = BigInt("900000000001");
+const KB_MAX_FILE_BYTES = 15 * 1024 * 1024;
 
 const redis = new Redis(REDIS_URL, { maxRetriesPerRequest: null });
 const webhookQueue = new Queue("meli-webhook-events", { connection: redis });
@@ -33,7 +37,7 @@ const app = express();
 app.disable("x-powered-by");
 app.set("trust proxy", true);
 app.use(cors());
-app.use(express.json({ limit: "8mb" }));
+app.use(express.json({ limit: "25mb" }));
 
 class HttpError extends Error {
   status: number;
@@ -53,6 +57,10 @@ function safeJson<T>(value: T): T {
 
 function sendJson(res: express.Response, value: unknown, status = 200) {
   return res.status(status).json(safeJson(value));
+}
+
+function queueJobId(value: string) {
+  return crypto.createHash("sha256").update(value).digest("hex");
 }
 
 function optionalEnv(name: string): string {
@@ -101,6 +109,15 @@ function decryptSecret(payload: string): string {
   const decipher = crypto.createDecipheriv("aes-256-gcm", getEncryptionKey(), iv);
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString("utf8");
+}
+
+function tryDecryptSecret(payload?: string): string {
+  if (!payload) return "";
+  try {
+    return decryptSecret(payload);
+  } catch {
+    return "";
+  }
 }
 
 async function withRedisLock<T>(key: string, ttlMs: number, fn: () => Promise<T>): Promise<T> {
@@ -241,12 +258,22 @@ type AutomationPolicy = {
   requireHumanForHighRisk?: boolean;
 };
 
+type HandoffReason = "buyer_requested_human" | "invoice_required" | "unmatched_other" | "ai_escalation";
+
+type HandoffDecision = {
+  required: boolean;
+  reason?: HandoffReason;
+  label?: string;
+};
+
 async function getFeishuWebhookConfig(shopId: string) {
   const config = await getSetting<FeishuWebhookConfig>(shopId, "feishu_webhook");
   if (!config?.webhookUrlEnc) return null;
+  const webhookUrl = tryDecryptSecret(config.webhookUrlEnc);
+  if (!webhookUrl) return null;
   return {
-    webhookUrl: decryptSecret(config.webhookUrlEnc),
-    secret: config.secretEnc ? decryptSecret(config.secretEnc) : "",
+    webhookUrl,
+    secret: tryDecryptSecret(config.secretEnc),
     enabled: config.enabled !== false,
     notifyPresale: config.notifyPresale !== false,
     notifyAftersale: config.notifyAftersale !== false
@@ -326,6 +353,38 @@ function parseSkuCsv(csv: string): Array<Record<string, string>> {
   });
 }
 
+function isWorkbookBytes(bytes: Buffer) {
+  return bytes.length >= 4
+    && bytes[0] === 0x50
+    && bytes[1] === 0x4b
+    && (bytes[2] === 0x03 || bytes[2] === 0x05 || bytes[2] === 0x07);
+}
+
+function parseSkuWorkbook(bytes: Buffer): Array<Record<string, string>> {
+  const workbook = XLSX.read(bytes, { type: "buffer", cellDates: false, raw: false });
+  const rows: Array<Record<string, string>> = [];
+
+  for (const sheetName of workbook.SheetNames) {
+    const sheet = workbook.Sheets[sheetName];
+    const sheetRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, {
+      defval: "",
+      raw: false,
+      blankrows: false
+    });
+
+    for (const row of sheetRows) {
+      const normalized = Object.fromEntries(
+        Object.entries(row)
+          .map(([key, value]) => [normalizeText(key), normalizeText(value)])
+          .filter(([key, value]) => key || value)
+      ) as Record<string, string>;
+      if (Object.values(normalized).some(Boolean)) rows.push({ ...normalized, sheetName });
+    }
+  }
+
+  return rows;
+}
+
 function decodedTextScore(text: string) {
   const badPatterns = ["\uFFFD", "锟", "閿", "鍙", "鏂", "涓", "涔", "鑱", "绋", "铆", "贸", "帽", "煤", "Ã", "Â"];
   let score = 0;
@@ -342,7 +401,7 @@ function decodeCsvPayload(body: unknown) {
   const directCsv = String(input.csv || "");
   if (directCsv) return directCsv;
 
-  const base64 = normalizeText(input.csvBase64);
+  const base64 = normalizeText(input.fileBase64 || input.csvBase64);
   if (!base64) return "";
 
   const bytes = Buffer.from(base64, "base64");
@@ -361,6 +420,135 @@ function decodeCsvPayload(body: unknown) {
   return decoded.sort((a, b) => a.score - b.score)[0]?.text || bytes.toString("utf8");
 }
 
+function parseSkuImportRows(body: unknown) {
+  const input = (body || {}) as Record<string, unknown>;
+  if (Array.isArray(input.items)) return input.items as Array<Record<string, unknown>>;
+
+  const base64 = normalizeText(input.fileBase64 || input.csvBase64);
+  if (base64) {
+    const bytes = Buffer.from(base64, "base64");
+    assertKbFileAllowed({
+      bytes,
+      fileName: normalizeText(input.fileName),
+      mimeType: normalizeText(input.mimeType),
+      allowed: new Set(["csv", "txt", "xlsx", "xls"]),
+      target: "商品资料"
+    });
+    if (isWorkbookBytes(bytes)) return parseSkuWorkbook(bytes);
+  }
+
+  return parseSkuCsv(decodeCsvPayload(body));
+}
+
+type ParsedKnowledgeFile = {
+  fileName: string;
+  type: "txt" | "pdf" | "docx";
+  title: string;
+  content: string;
+  characters: number;
+};
+
+function stripDataUrlBase64(value: string) {
+  const [, payload] = value.split(",", 2);
+  return value.startsWith("data:") && payload ? payload : value;
+}
+
+function extensionOf(fileName: string) {
+  const match = fileName.toLowerCase().match(/\.([a-z0-9]+)$/);
+  return match?.[1] || "";
+}
+
+function inferKbFileType(input: { fileName?: string; mimeType?: string; bytes: Buffer }) {
+  const extension = extensionOf(input.fileName || "");
+  const mimeType = normalizeText(input.mimeType).toLowerCase();
+  if (extension === "pdf" || mimeType.includes("pdf") || input.bytes.subarray(0, 4).toString("utf8") === "%PDF") return "pdf";
+  if (extension === "docx" || mimeType.includes("wordprocessingml")) return "docx";
+  if (extension === "xlsx" || extension === "xls" || mimeType.includes("spreadsheet") || isWorkbookBytes(input.bytes)) return "xlsx";
+  if (extension === "csv" || mimeType.includes("csv")) return "csv";
+  if (extension === "txt" || mimeType.startsWith("text/")) return "txt";
+  return extension || "unknown";
+}
+
+function assertKbFileAllowed(input: {
+  bytes: Buffer;
+  fileName?: string;
+  mimeType?: string;
+  allowed: Set<string>;
+  target: string;
+}) {
+  if (!input.bytes.length) throw new HttpError(400, "文件内容为空，请重新选择文件");
+  if (input.bytes.length > KB_MAX_FILE_BYTES) throw new HttpError(400, "文件过大，单个知识库文件不能超过 15MB");
+  const type = inferKbFileType(input);
+  if (!input.allowed.has(type)) {
+    throw new HttpError(400, `${input.target}暂不支持 ${type === "unknown" ? "该文件类型" : `.${type} 文件`}，请上传 ${[...input.allowed].map((item) => `.${item}`).join("、")}`);
+  }
+  return type;
+}
+
+function decodeTextBytes(bytes: Buffer, requested = "auto") {
+  const encodings = requested && requested !== "auto"
+    ? [requested]
+    : ["utf-8", "gb18030", "utf-16le", "big5"];
+  const decoded = encodings.flatMap((encoding) => {
+    try {
+      const text = new TextDecoder(encoding, { fatal: encoding === "utf-8" }).decode(bytes).replace(/^\uFEFF/, "");
+      return [{ text, score: decodedTextScore(text) }];
+    } catch {
+      return [];
+    }
+  });
+  return (decoded.sort((a, b) => a.score - b.score)[0]?.text || bytes.toString("utf8")).trim();
+}
+
+function titleFromFileName(fileName: string) {
+  const base = (fileName || "售前资料").replace(/\.[^.]+$/, "").trim();
+  return base || "售前资料";
+}
+
+async function parseKnowledgeDocumentFile(body: unknown): Promise<ParsedKnowledgeFile | null> {
+  const input = (body || {}) as Record<string, unknown>;
+  const base64 = normalizeText(input.fileBase64);
+  if (!base64) return null;
+
+  const fileName = normalizeText(input.fileName) || "售前资料.txt";
+  const mimeType = normalizeText(input.mimeType);
+  const bytes = Buffer.from(stripDataUrlBase64(base64), "base64");
+  const type = assertKbFileAllowed({
+    bytes,
+    fileName,
+    mimeType,
+    allowed: new Set(["txt", "pdf", "docx"]),
+    target: "文本资料"
+  }) as ParsedKnowledgeFile["type"];
+
+  let content = "";
+  if (type === "txt") {
+    content = decodeTextBytes(bytes, normalizeText(input.encoding).toLowerCase());
+  } else if (type === "docx") {
+    const result = await mammoth.extractRawText({ buffer: bytes });
+    content = String(result.value || "").replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  } else if (type === "pdf") {
+    const parser = new PDFParse({ data: bytes });
+    try {
+      const result = await parser.getText();
+      content = String(result.text || "").replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+    } finally {
+      await parser.destroy();
+    }
+  }
+
+  content = content.trim();
+  if (!content) throw new HttpError(400, "没有从文件中解析到可用文字，请检查文件内容后重试");
+
+  return {
+    fileName,
+    type,
+    title: titleFromFileName(fileName),
+    content,
+    characters: content.length
+  };
+}
+
 function pickInput(input: Record<string, unknown>, keys: string[]): unknown {
   for (const key of keys) {
     if (input[key] !== undefined && input[key] !== null && String(input[key]).trim() !== "") return input[key];
@@ -369,14 +557,26 @@ function pickInput(input: Record<string, unknown>, keys: string[]): unknown {
 }
 
 function mapSkuInput(input: Record<string, unknown>) {
+  const sku = normalizeText(pickInput(input, ["sku", "SKU"]));
+  const title = normalizeText(pickInput(input, [
+    "title",
+    "TITLE",
+    "titulo",
+    "TITULO",
+    "name",
+    "nombre",
+    "\u6807\u9898",
+    "\u5546\u54c1\u6807\u9898",
+    "\u5546\u54c1\u540d\u79f0"
+  ])) || sku;
   return {
-    sku: normalizeText(pickInput(input, ["sku", "SKU"])),
+    sku,
     itemId: normalizeText(pickInput(input, ["itemId", "item_id", "item", "\u5546\u54c1ID", "\u5546\u54c1\u7f16\u53f7", "Item"])),
-    title: normalizeText(pickInput(input, ["title", "titulo", "name", "nombre", "\u6807\u9898", "\u5546\u54c1\u6807\u9898", "\u5546\u54c1\u540d\u79f0"])),
+    title,
     brand: normalizeText(pickInput(input, ["brand", "marca", "\u54c1\u724c"])),
-    category: normalizeText(pickInput(input, ["category", "categoria", "\u7c7b\u76ee", "\u5206\u7c7b"])),
+    category: normalizeText(pickInput(input, ["category", "categoria", "\u7c7b\u76ee", "\u5206\u7c7b", "sheetName"])),
     locale: normalizeText(input.locale) || "es-MX",
-    sellingPoints: normalizeText(pickInput(input, ["sellingPoints", "selling_points", "description", "\u5356\u70b9", "\u4ea7\u54c1\u8bf4\u660e", "\u5546\u54c1\u8bf4\u660e"])),
+    sellingPoints: normalizeText(pickInput(input, ["sellingPoints", "selling_points", "description", "DESCRIPTION", "Descripcion", "DESCRIPCION", "descripción", "descripcion", "\u5356\u70b9", "\u4ea7\u54c1\u8bf4\u660e", "\u5546\u54c1\u8bf4\u660e"])),
     faq: normalizeText(pickInput(input, ["faq", "FAQ", "\u5e38\u89c1\u95ee\u9898"])),
     warrantyPolicy: normalizeText(pickInput(input, ["warrantyPolicy", "warranty_policy", "garantia", "garant\u00eda", "\u4fdd\u4fee", "\u4fdd\u4fee\u653f\u7b56"])),
     invoicePolicy: normalizeText(pickInput(input, ["invoicePolicy", "invoice_policy", "factura", "\u53d1\u7968", "\u53d1\u7968\u89c4\u5219"])),
@@ -411,11 +611,11 @@ function skuToKnowledge(input: {
   };
 }
 
-async function upsertSkuKnowledge(shopId: string, input: Record<string, unknown>) {
+async function upsertSkuKnowledge(shopId: string, input: Record<string, unknown>, client: Prisma.TransactionClient | typeof prisma = prisma) {
   const mapped = mapSkuInput(input);
   if (!mapped.sku || !mapped.title) throw new HttpError(400, "sku and title are required");
 
-  return prisma.skuKnowledge.upsert({
+  return client.skuKnowledge.upsert({
     where: { shopId_sku: { shopId, sku: mapped.sku } },
     create: {
       shopId,
@@ -432,6 +632,75 @@ async function upsertSkuKnowledge(shopId: string, input: Record<string, unknown>
       active: input.active === undefined ? true : Boolean(input.active)
     }
   });
+}
+
+function skuKnowledgeContent(input: {
+  sku?: string | null;
+  title?: string | null;
+  brand?: string | null;
+  category?: string | null;
+  sellingPoints?: string | null;
+  faq?: string | null;
+  warrantyPolicy?: string | null;
+  invoicePolicy?: string | null;
+  shippingNotes?: string | null;
+  returnPolicy?: string | null;
+  forbiddenNotes?: string | null;
+}) {
+  return [
+    `SKU: ${input.sku || "-"}`,
+    `Nombre: ${input.title || "-"}`,
+    input.brand ? `Marca: ${input.brand}` : "",
+    input.category ? `Tienda/Grupo: ${input.category}` : "",
+    input.sellingPoints ? `Descripción:\n${input.sellingPoints}` : "",
+    input.faq ? `Preguntas frecuentes:\n${input.faq}` : "",
+    input.invoicePolicy ? `Facturación:\n${input.invoicePolicy}` : "",
+    input.warrantyPolicy ? `Garantía:\n${input.warrantyPolicy}` : "",
+    input.shippingNotes ? `Envío:\n${input.shippingNotes}` : "",
+    input.returnPolicy ? `Devoluciones:\n${input.returnPolicy}` : "",
+    input.forbiddenNotes ? `Notas prohibidas:\n${input.forbiddenNotes}` : ""
+  ].filter(Boolean).join("\n\n");
+}
+
+async function reindexSkuKnowledge(tx: Prisma.TransactionClient, shopId: string, skuKnowledge: Awaited<ReturnType<typeof upsertSkuKnowledge>>) {
+  const title = `SKU ${skuKnowledge.sku}`;
+  const content = skuKnowledgeContent(skuKnowledge);
+  const sku = skuKnowledge.sku;
+  const plan = fallbackChunkPlan(title, "product", content, sku);
+
+  const existing = await tx.kbDocument.findMany({ where: { shopId, docType: "product", title } });
+  if (existing.length) await tx.kbDocument.deleteMany({ where: { id: { in: existing.map((document) => document.id) } } });
+
+  const document = await tx.kbDocument.create({
+    data: {
+      shopId,
+      title,
+      docType: "product",
+      content,
+      locale: skuKnowledge.locale || "es-MX",
+      status: "indexed"
+    }
+  });
+
+  await createChunksWithEmbeddings(tx, plan.chunks.map((chunk) => ({
+    documentId: document.id,
+    shopId,
+    content: chunk.content,
+    metadata: safeJson({
+      title: chunk.title,
+      doc_type: chunk.doc_type,
+      sku_tags: [sku],
+      intent_tags: ["presale", "product"],
+      risk_tags: chunk.risk_tags,
+      source_title: title,
+      source: "sku_import",
+      skuKnowledgeId: skuKnowledge.id,
+      category: skuKnowledge.category
+    }) as Prisma.InputJsonValue,
+    scoreHint: chunk.priority
+  })));
+
+  return document;
 }
 
 type AiRuntimeConfig = {
@@ -729,9 +998,129 @@ function lexicalScore(query: string, text: string): number {
   return terms.reduce((score, term) => score + (haystack.includes(term) ? 1 : 0), 0);
 }
 
+function dynamicTopK(query: string, requested?: number) {
+  if (requested && Number.isFinite(requested)) return Math.max(1, Math.min(requested, 30));
+  const termCount = tokenize(query).length;
+  if (termCount <= 4) return 5;
+  if (termCount <= 12) return 8;
+  return 12;
+}
+
+function hash32(input: string) {
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function normalizeVector(vector: number[]) {
+  const norm = Math.sqrt(vector.reduce((total, value) => total + value * value, 0)) || 1;
+  return vector.map((value) => Number((value / norm).toFixed(8)));
+}
+
+function localEmbedding(text: string, dimensions = 1536) {
+  const vector = Array.from({ length: dimensions }, () => 0);
+  const terms = tokenize(text);
+  for (const term of terms) {
+    const idx = hash32(term) % dimensions;
+    const sign = hash32(`${term}:sign`) % 2 === 0 ? 1 : -1;
+    vector[idx] += sign * (1 + Math.min(term.length, 16) / 16);
+  }
+  return normalizeVector(vector);
+}
+
+function vectorLiteral(vector: number[]) {
+  return `[${vector.map((value) => Number.isFinite(value) ? value.toFixed(8) : "0").join(",")}]`;
+}
+
+async function embedTexts(texts: string[]) {
+  const apiKey = optionalEnv("EMBEDDING_API_KEY") || optionalEnv("OPENAI_API_KEY");
+  const model = optionalEnv("EMBEDDING_MODEL") || optionalEnv("OPENAI_EMBEDDING_MODEL");
+  const baseUrl = optionalEnv("EMBEDDING_BASE_URL") || optionalEnv("OPENAI_BASE_URL") || "https://api.openai.com/v1";
+  if (!apiKey || !model) return texts.map((text) => localEmbedding(text));
+
+  try {
+    const vectors: number[][] = [];
+    for (let index = 0; index < texts.length; index += 64) {
+      const input = texts.slice(index, index + 64);
+      const response = await fetch(`${baseUrl.replace(/\/$/, "")}/embeddings`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ model, input })
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = await response.json() as { data?: Array<{ embedding?: number[] }> };
+      for (const item of payload.data || []) {
+        if (!Array.isArray(item.embedding)) throw new Error("missing embedding vector");
+        vectors.push(normalizeVector(item.embedding.slice(0, 1536)));
+      }
+    }
+    if (vectors.length === texts.length) return vectors;
+  } catch (error) {
+    console.warn("[rag] embedding API failed, using local deterministic embeddings", error instanceof Error ? error.message : String(error));
+  }
+
+  return texts.map((text) => localEmbedding(text));
+}
+
+let vectorSchemaReady: Promise<boolean> | null = null;
+
+async function ensureVectorSchema() {
+  if (!vectorSchemaReady) {
+    vectorSchemaReady = (async () => {
+      try {
+        await prisma.$executeRawUnsafe("CREATE EXTENSION IF NOT EXISTS vector");
+        await prisma.$executeRawUnsafe("CREATE INDEX IF NOT EXISTS kb_chunks_embedding_hnsw_idx ON kb_chunks USING hnsw (embedding vector_cosine_ops)");
+        return true;
+      } catch (error) {
+        console.warn("[rag] pgvector schema unavailable, lexical fallback remains active", error instanceof Error ? error.message : String(error));
+        return false;
+      }
+    })();
+  }
+  return vectorSchemaReady;
+}
+
+async function createChunksWithEmbeddings(tx: Prisma.TransactionClient, chunks: Array<{
+  documentId: string;
+  shopId: string;
+  content: string;
+  metadata: Prisma.InputJsonValue;
+  scoreHint?: number;
+}>) {
+  const embeddings = await embedTexts(chunks.map((chunk) => chunk.content));
+  const canStoreVectors = await ensureVectorSchema();
+  const created = [];
+  for (let index = 0; index < chunks.length; index += 1) {
+    const chunk = await tx.kbChunk.create({
+      data: {
+        documentId: chunks[index].documentId,
+        shopId: chunks[index].shopId,
+        content: chunks[index].content,
+        metadata: chunks[index].metadata,
+        scoreHint: chunks[index].scoreHint
+      }
+    });
+    if (canStoreVectors) {
+      await tx.$executeRawUnsafe(
+        "UPDATE kb_chunks SET embedding = $1::vector WHERE id = $2::uuid",
+        vectorLiteral(embeddings[index]),
+        chunk.id
+      );
+    }
+    created.push(chunk);
+  }
+  return created;
+}
+
 async function retrieveKnowledge(shopId: string, query: string, options: { sku?: string; limit?: number } = {}): Promise<KnowledgeHit[]> {
   const sku = normalizeText(options.sku);
-  const limit = options.limit || 6;
+  const limit = dynamicTopK(query, options.limit);
   const hits: KnowledgeHit[] = [];
 
   if (sku) {
@@ -748,6 +1137,56 @@ async function retrieveKnowledge(shopId: string, query: string, options: { sku?:
         skuKnowledge.forbiddenNotes
       ].filter(Boolean).join("\n");
       hits.push({ id: skuKnowledge.id, title: `SKU ${skuKnowledge.sku}`, docType: "product", content, source: "sku", score: 10 });
+    }
+  }
+
+  if (await ensureVectorSchema()) {
+    try {
+      const [queryVector] = await embedTexts([query]);
+      const vectorRows = await prisma.$queryRawUnsafe<Array<{
+        id: string;
+        title: string;
+        doc_type: string;
+        content: string;
+        metadata: Prisma.JsonValue | null;
+        score_hint: unknown;
+        similarity: unknown;
+      }>>(
+        `SELECT c.id, d.title, d.doc_type, c.content, c.metadata, c.score_hint,
+                1 - (c.embedding <=> $1::vector) AS similarity
+           FROM kb_chunks c
+           JOIN kb_documents d ON d.id = c.document_id
+          WHERE c.embedding IS NOT NULL
+            AND (c.shop_id = $2::uuid OR c.shop_id IS NULL)
+          ORDER BY c.embedding <=> $1::vector
+          LIMIT $3`,
+        vectorLiteral(queryVector),
+        shopId,
+        Math.max(limit * 4, 20)
+      );
+
+      for (const row of vectorRows) {
+        const meta = (row.metadata || {}) as Record<string, unknown>;
+        const skuTags = Array.isArray(meta.sku_tags) ? meta.sku_tags.map((tag) => String(tag)) : [];
+        if (sku && skuTags.length && !skuTags.includes(sku)) continue;
+        const semantic = Number(row.similarity || 0);
+        const scoreHint = Number(row.score_hint || 0);
+        const lexical = lexicalScore(query, `${row.content} ${JSON.stringify(meta)}`);
+        const threshold = tokenize(query).length <= 4 ? 0.03 : 0.015;
+        if (semantic >= threshold || lexical > 0) {
+          hits.push({
+            id: row.id,
+            title: normalizeText(meta.title) || row.title,
+            docType: normalizeText(meta.doc_type) || row.doc_type,
+            content: row.content,
+            source: "chunk",
+            metadata: meta,
+            score: semantic * 20 + lexical + scoreHint
+          });
+        }
+      }
+    } catch (error) {
+      console.warn("[rag] vector search failed, using lexical fallback", error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -779,7 +1218,13 @@ async function retrieveKnowledge(shopId: string, query: string, options: { sku?:
     }
   }
 
-  return hits.sort((a, b) => (b.score || 0) - (a.score || 0)).slice(0, limit);
+  const deduped = new Map<string, KnowledgeHit>();
+  for (const hit of hits.sort((a, b) => (b.score || 0) - (a.score || 0))) {
+    const key = hit.id || `${hit.title}:${hit.content.slice(0, 80)}`;
+    if (!deduped.has(key)) deduped.set(key, hit);
+  }
+
+  return [...deduped.values()].slice(0, limit);
 }
 
 const DEFAULT_REPLY_TEMPLATES = [
@@ -806,9 +1251,9 @@ const DEFAULT_REPLY_TEMPLATES = [
     intentCode: "invoice_request",
     category: "invoice_request",
     keywords: ["factura", "facturar", "cfdi", "rfc"],
-    content: "Hola, gracias por la información. Vamos a revisar los datos de facturación y, si falta algún dato adicional, te contactaremos por este medio.",
+    content: "Hola, con gusto te apoyamos con la factura. Por favor compártenos por este chat de Mercado Libre tu RFC, razón social, régimen fiscal, uso de CFDI, forma de pago y código postal fiscal para que nuestro equipo pueda revisarlo.",
     variables: ["orderId"],
-    requiresReview: false
+    requiresReview: true
   },
   {
     name: "转人工安抚",
@@ -845,6 +1290,15 @@ const DEFAULT_REPLY_TEMPLATES = [
     content: "Hola, entendemos tu solicitud. Cualquier reembolso debe revisarse y procesarse mediante el flujo oficial de Mercado Libre según el estado del pedido.",
     variables: ["orderId"],
     requiresReview: false
+  },
+  {
+    name: "未识别问题转人工",
+    intentCode: "other",
+    category: "other",
+    keywords: [],
+    content: "Hola, gracias por escribirnos. Vamos a revisar tu caso con nuestro equipo de atención y te responderemos por este mismo chat de Mercado Libre.",
+    variables: ["packId", "orderId"],
+    requiresReview: true
   }
 ];
 
@@ -868,6 +1322,7 @@ async function ensureDefaultReplyTemplates(shopId: string) {
       update: {
         category: template.category,
         keywords: template.keywords,
+        content: template.content,
         variables: template.variables,
         requiresReview: template.requiresReview
       }
@@ -881,6 +1336,13 @@ function fillReplyTemplate(content: string, values: Record<string, unknown>) {
   return content.replace(/\{([a-zA-Z0-9_]+)\}/g, (_match, key) => normalizeText(values[key]) || "-");
 }
 
+function replyTemplateKeywordScore(template: { keywords: string[] }, normalizedText: string) {
+  return template.keywords.reduce((total, keyword) => {
+    const normalizedKeyword = normalizeText(keyword).toLowerCase();
+    return total + (normalizedKeyword && normalizedText.includes(normalizedKeyword) ? 1 : 0);
+  }, 0);
+}
+
 async function findBestReplyTemplate(shopId: string, intentCode: string | null | undefined, text: string) {
   const templates = await prisma.replyTemplate.findMany({
     where: { shopId, active: true },
@@ -890,15 +1352,224 @@ async function findBestReplyTemplate(shopId: string, intentCode: string | null |
 
   const normalizedIntent = normalizeText(intentCode);
   const normalizedText = normalizeText(text).toLowerCase();
-  const exact = templates.find((template) => template.intentCode === normalizedIntent);
-  if (exact) return exact;
+  const exactMatches = templates.filter((template) => template.intentCode === normalizedIntent);
+  if (exactMatches.length === 1) return exactMatches[0];
+  if (exactMatches.length > 1) {
+    const scoredMatches = exactMatches
+      .map((template) => ({ template, score: replyTemplateKeywordScore(template, normalizedText) }))
+      .sort((a, b) => b.score - a.score || b.template.updatedAt.getTime() - a.template.updatedAt.getTime());
+    if (scoredMatches[0]?.score > 0 && scoredMatches[0].score > (scoredMatches[1]?.score ?? -1)) {
+      return scoredMatches[0].template;
+    }
+    return null;
+  }
 
-  return templates
+  const scored = templates
     .map((template) => ({
       template,
-      score: template.keywords.reduce((total, keyword) => total + (normalizedText.includes(keyword.toLowerCase()) ? 1 : 0), 0)
+      score: replyTemplateKeywordScore(template, normalizedText)
     }))
-    .sort((a, b) => b.score - a.score)[0]?.template || null;
+    .sort((a, b) => b.score - a.score || b.template.updatedAt.getTime() - a.template.updatedAt.getTime());
+  if (scored[0]?.score > 0 && scored[0].score > (scored[1]?.score ?? -1)) return scored[0].template;
+  return templates.find((template) => template.intentCode === "other") || null;
+}
+
+async function assertNoActiveReplyTemplateConflict(input: {
+  shopId: string;
+  id?: string;
+  intentCode: string;
+  language: string;
+  scenario: string | null;
+  active: boolean;
+}) {
+  if (!input.active) return;
+  const conflict = await prisma.replyTemplate.findFirst({
+    where: {
+      shopId: input.shopId,
+      active: true,
+      intentCode: input.intentCode,
+      language: input.language,
+      scenario: input.scenario,
+      id: input.id ? { not: input.id } : undefined
+    },
+    select: { id: true, name: true, intentCode: true }
+  });
+  if (conflict) {
+    throw new HttpError(409, `同一店铺、语言和问题类型只能启用一条预设回复。请先停用「${conflict.name}」或改用不同的问题类型。`);
+  }
+}
+
+function categoryLabel(category: string | null | undefined) {
+  const map: Record<string, string> = {
+    human_request: "买家要求人工",
+    invoice_request: "开票待人工",
+    other: "未识别问题",
+    claim_opened: "平台纠纷",
+    not_received: "未收到货",
+    shipping_not_received: "物流未收到",
+    shipping_delay: "物流延迟",
+    damaged_item: "商品损坏",
+    damaged_product: "商品损坏",
+    refund_request: "退款问题",
+    return_request: "退换货",
+    warranty: "保修咨询"
+  };
+  return map[normalizeText(category)] || normalizeText(category) || "未分类";
+}
+
+function statusLabel(status: string | null | undefined) {
+  const map: Record<string, string> = {
+    open: "待跟进",
+    human_pending: "人工待处理",
+    closed: "已关闭"
+  };
+  return map[normalizeText(status)] || normalizeText(status) || "未知状态";
+}
+
+function decideAftersaleHandoff(input: { category?: string | null; shouldEscalate?: boolean | null; status?: string | null }): HandoffDecision {
+  const category = normalizeText(input.category);
+  if (category === "human_request") return { required: true, reason: "buyer_requested_human", label: "买家要求人工" };
+  if (category === "invoice_request") return { required: true, reason: "invoice_required", label: "开票待人工" };
+  if (category === "other") return { required: true, reason: "unmatched_other", label: "未识别问题转人工" };
+  if (input.status === "human_pending") return { required: true, reason: "ai_escalation", label: "人工待处理" };
+  return { required: false };
+}
+
+function handoffLabel(reason: string | null | undefined) {
+  const map: Record<string, string> = {
+    buyer_requested_human: "买家要求人工",
+    invoice_required: "开票待人工",
+    unmatched_other: "未识别问题",
+    ai_escalation: "风险规则转人工"
+  };
+  return map[normalizeText(reason)] || "无需人工";
+}
+
+function pickInvoiceValue(text: string, patterns: RegExp[]) {
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    const value = normalizeText(match?.[1])
+      .replace(/\s+(RFC|raz[oó]n social|nombre fiscal|r[eé]gimen fiscal|regimen|uso de cfdi|cfdi|forma de pago|m[eé]todo de pago|metodo de pago|c[oó]digo postal fiscal|codigo postal fiscal|cp fiscal|c\.?p\.?)\b.*$/i, "")
+      .replace(/[。.;；,，]+$/, "");
+    if (value) return value.slice(0, 80);
+  }
+  return "";
+}
+
+function buildInvoiceFieldSummary(conversationText: string) {
+  const compact = conversationText.replace(/\s+/g, " ").trim();
+  const fields = [
+    {
+      label: "RFC",
+      value: pickInvoiceValue(compact, [
+        /\bRFC\s*[:：]?\s*([A-ZÑ&]{3,4}\d{6}[A-Z0-9]{3})\b/i,
+        /\b([A-ZÑ&]{3,4}\d{6}[A-Z0-9]{3})\b/i
+      ])
+    },
+    {
+      label: "Razón social",
+      value: pickInvoiceValue(compact, [
+        /raz[oó]n social\s*[:：]?\s*([^,;，；\n]+)/i,
+        /nombre fiscal\s*[:：]?\s*([^,;，；\n]+)/i
+      ])
+    },
+    {
+      label: "Régimen fiscal",
+      value: pickInvoiceValue(compact, [
+        /r[eé]gimen fiscal\s*[:：]?\s*([^,;，；\n]+)/i,
+        /regimen\s*[:：]?\s*([^,;，；\n]+)/i
+      ])
+    },
+    {
+      label: "Uso de CFDI",
+      value: pickInvoiceValue(compact, [
+        /uso de cfdi\s*[:：]?\s*([^,;，；\n]+)/i,
+        /cfdi\s*[:：]?\s*([^,;，；\n]+)/i
+      ])
+    },
+    {
+      label: "Forma de pago",
+      value: pickInvoiceValue(compact, [
+        /forma de pago\s*[:：]?\s*([^,;，；\n]+)/i,
+        /m[eé]todo de pago\s*[:：]?\s*([^,;，；\n]+)/i,
+        /metodo de pago\s*[:：]?\s*([^,;，；\n]+)/i
+      ])
+    },
+    {
+      label: "Código postal fiscal",
+      value: pickInvoiceValue(compact, [
+        /c[oó]digo postal fiscal\s*[:：]?\s*(\d{5})/i,
+        /codigo postal fiscal\s*[:：]?\s*(\d{5})/i,
+        /\bcp fiscal\s*[:：]?\s*(\d{5})/i,
+        /\bc\.?p\.?\s*[:：]?\s*(\d{5})/i
+      ])
+    }
+  ];
+
+  return fields.map((field) => `- ${field.label}: ${field.value ? `已收到 ${field.value}` : "待买家补充"}`).join("\n");
+}
+
+function buildAftersaleHandoffNotice(input: {
+  shopName?: string | null;
+  handoff: HandoffDecision;
+  packId: string;
+  orderId?: string | null;
+  buyerMessage: string;
+  conversationText?: string | null;
+  suggestedAction?: string | null;
+  suggestedReply?: string | null;
+}) {
+  const title = input.handoff.reason === "invoice_required"
+    ? "[Mercado Libre] 开票待处理"
+    : input.handoff.reason === "unmatched_other"
+      ? "[Mercado Libre] 未识别售后问题转人工"
+      : "[Mercado Libre] 售后转人工提醒";
+  const lines = [
+    title,
+    `Shop: ${input.shopName || "-"}`,
+    `Pack: ${input.packId}`,
+    `Order: ${input.orderId || "-"}`,
+    `Reason: ${input.handoff.label || handoffLabel(input.handoff.reason)}`,
+    `Buyer message: ${input.buyerMessage}`,
+    `Suggested action: ${input.suggestedAction || "-"}`
+  ];
+  if (input.handoff.reason === "invoice_required") {
+    lines.push(
+      "",
+      "开票资料核对：",
+      buildInvoiceFieldSummary(input.conversationText || input.buyerMessage),
+      "",
+      "客服动作：请优先检查待补充项，确认资料齐全后再人工开票；不要引导买家到 Mercado Libre 站外提交资料。"
+    );
+  }
+  if (input.suggestedReply) lines.push(`Auto reply: ${input.suggestedReply}`);
+  return lines.join("\n");
+}
+
+function withAftersaleComputedFields<T extends { category?: string | null; status?: string | null; messages?: unknown[]; _count?: { messages?: number } }>(thread: T) {
+  const handoff = decideAftersaleHandoff({ category: thread.category, status: thread.status });
+  return {
+    ...thread,
+    messageCount: thread._count?.messages ?? thread.messages?.length ?? 0,
+    handoffRequired: handoff.required,
+    handoffReason: handoff.reason,
+    handoffLabel: handoff.label
+  };
+}
+
+function countBy<T>(items: T[], key: (item: T) => string | null | undefined) {
+  const counts = new Map<string, number>();
+  for (const item of items) {
+    const value = normalizeText(key(item)) || "unknown";
+    counts.set(value, (counts.get(value) || 0) + 1);
+  }
+  return counts;
+}
+
+function toChart(counts: Map<string, number>, labeler: (key: string) => string) {
+  return [...counts.entries()]
+    .map(([key, value]) => ({ key, value, label: labeler(key) }))
+    .sort((a, b) => b.value - a.value);
 }
 
 async function findSkuKnowledgeForQuestion(question: { shopId: string; itemId: string; rawItem?: Prisma.JsonValue | null }) {
@@ -1002,6 +1673,7 @@ function buildStreamingPresaleDraft(answer: string, fallback: PresaleReply): Pre
 
 async function generateAftersaleWithAi(input: {
   latestMessage: string;
+  conversationHistory?: string[];
   orderStatus?: string;
   shipmentStatus?: string;
   hasClaim?: boolean;
@@ -1146,7 +1818,7 @@ async function getFreshMeliAccessToken(shopId: string) {
 
 async function postMeliAnswer(shopId: string, questionId: bigint, text: string) {
   const accessToken = await getFreshMeliAccessToken(shopId);
-  const path = "/answers";
+  const path = "/marketplace/answers";
   const startedAt = Date.now();
   let statusCode: number | undefined;
   let errorText = "";
@@ -1159,13 +1831,47 @@ async function postMeliAnswer(shopId: string, questionId: bigint, text: string) 
         Accept: "application/json",
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({ question_id: questionId.toString(), text })
+      body: JSON.stringify({ question_id: questionId.toString(), text, text_translated: "" })
     });
     statusCode = response.status;
     const body = await response.text();
     if (!response.ok) {
       errorText = body.slice(0, 1000);
       throw new HttpError(502, `Mercado Libre answer failed: HTTP ${response.status} ${errorText}`);
+    }
+    return body ? JSON.parse(body) as unknown : {};
+  } catch (error) {
+    errorText = errorText || (error instanceof Error ? error.message : String(error));
+    throw error;
+  } finally {
+    await prisma.apiCallLog.create({
+      data: { shopId, method: "POST", path, statusCode, latencyMs: Date.now() - startedAt, error: errorText || undefined }
+    }).catch(() => undefined);
+  }
+}
+
+async function postMeliPackMessage(shopId: string, packId: bigint, text: string) {
+  const accessToken = await getFreshMeliAccessToken(shopId);
+  const path = `/marketplace/messages/packs/${packId.toString()}`;
+  const startedAt = Date.now();
+  let statusCode: number | undefined;
+  let errorText = "";
+
+  try {
+    const response = await fetch(`https://api.mercadolibre.com${path}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/json",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ text, text_translated: "" })
+    });
+    statusCode = response.status;
+    const body = await response.text();
+    if (!response.ok) {
+      errorText = body.slice(0, 1000);
+      throw new HttpError(502, `Mercado Libre post-sale message failed: HTTP ${response.status} ${errorText}`);
     }
     return body ? JSON.parse(body) as unknown : {};
   } catch (error) {
@@ -1308,7 +2014,7 @@ app.post("/auth/meli/refresh", async (req, res, next) => {
 app.post("/webhooks/meli", async (req, res, next) => {
   try {
     const secret = optionalEnv("WEBHOOK_SHARED_SECRET");
-    if (secret && req.headers["x-webhook-secret"] && req.headers["x-webhook-secret"] !== secret) {
+    if (secret && req.headers["x-webhook-secret"] !== secret) {
       throw new HttpError(401, "Invalid webhook secret");
     }
 
@@ -1329,7 +2035,7 @@ app.post("/webhooks/meli", async (req, res, next) => {
     });
 
     await webhookQueue.add("process-meli-webhook", { dedupeKey }, {
-      jobId: dedupeKey,
+      jobId: queueJobId(dedupeKey),
       attempts: 5,
       backoff: { type: "exponential", delay: 10_000 },
       removeOnComplete: 1000,
@@ -1378,35 +2084,75 @@ app.get("/dashboard", async (req, res, next) => {
     const shopId = await resolveShopId(req);
     const today = new Date();
     today.setHours(0, 0, 0, 0);
-    const [shop, presalePending, presaleReady, presaleNeedsHuman, aftersaleOpen, aftersaleHigh, knowledgeFailed, todayReplied, aiCount, acceptedCount, templateCount, tokenCount] = await Promise.all([
+    const weekStart = new Date(today);
+    weekStart.setDate(weekStart.getDate() - 6);
+    const [shop, presalePending, presaleReady, presaleNeedsHuman, aftersaleOpen, aftersaleHumanPending, aftersaleHigh, knowledgeFailed, todayReplied, aiCount, acceptedCount, templateCount, tokenCount, aftersaleThreads, recentActions] = await Promise.all([
       prisma.shop.findUnique({ where: { id: shopId } }),
       prisma.presaleQuestion.count({ where: { shopId, reviewStatus: "pending" } }),
       prisma.presaleQuestion.count({ where: { shopId, reviewStatus: "draft_ready" } }),
       prisma.presaleQuestion.count({ where: { shopId, reviewStatus: "needs_human" } }),
       prisma.aftersaleThread.count({ where: { shopId, status: "open" } }),
+      prisma.aftersaleThread.count({ where: { shopId, status: "human_pending" } }),
       prisma.aftersaleThread.count({ where: { shopId, riskLevel: "high" } }),
       prisma.kbDocument.count({ where: { shopId, status: { in: ["failed", "partial_failed"] } } }),
       prisma.presaleQuestion.count({ where: { shopId, sentAt: { gte: today } } }),
       prisma.aiSuggestion.count({ where: { shopId } }),
       prisma.aiSuggestion.count({ where: { shopId, accepted: true } }),
       prisma.replyTemplate.count({ where: { shopId, active: true } }),
-      prisma.meliToken.count({ where: { shopId } })
+      prisma.meliToken.count({ where: { shopId } }),
+      prisma.aftersaleThread.findMany({
+        where: { shopId },
+        select: { category: true, status: true, riskLevel: true, updatedAt: true },
+        orderBy: { updatedAt: "desc" },
+        take: 1000
+      }),
+      prisma.operationLog.findMany({
+        where: {
+          shopId,
+          createdAt: { gte: weekStart },
+          action: { in: ["presale.send.dry_run", "presale.send.real", "aftersale.send.dry_run", "aftersale.close"] }
+        },
+        select: { createdAt: true },
+        take: 1000
+      })
     ]);
 
     const pendingReviews = presaleReady;
     const adoptionRate = aiCount ? Math.round((acceptedCount / aiCount) * 100) : 0;
+    const dailyProcessed = Array.from({ length: 7 }, (_unused, index) => {
+      const date = new Date(weekStart);
+      date.setDate(weekStart.getDate() + index);
+      const key = date.toISOString().slice(0, 10);
+      return {
+        date: key,
+        value: recentActions.filter((action) => action.createdAt.toISOString().slice(0, 10) === key).length
+      };
+    });
+    const handoffCounts = new Map<string, number>();
+    for (const thread of aftersaleThreads) {
+      const handoff = decideAftersaleHandoff({ category: thread.category, status: thread.status });
+      if (handoff.required && handoff.reason) handoffCounts.set(handoff.reason, (handoffCounts.get(handoff.reason) || 0) + 1);
+    }
     return sendJson(res, {
       success: true,
       shop,
       metrics: {
         pendingConsultations: presalePending + presaleNeedsHuman,
         pendingReviews,
-        aftersaleFollowups: aftersaleOpen,
+        aftersaleFollowups: aftersaleOpen + aftersaleHumanPending,
         knowledgeFailed,
         todayReplied,
         adoptionRate,
         templateCount,
-        highRisk: aftersaleHigh
+        highRisk: aftersaleHigh,
+        invoiceHandoff: handoffCounts.get("invoice_required") || 0,
+        humanPending: aftersaleHumanPending
+      },
+      charts: {
+        categoryBreakdown: toChart(countBy(aftersaleThreads, (thread) => thread.category), categoryLabel),
+        statusBreakdown: toChart(countBy(aftersaleThreads, (thread) => thread.status), statusLabel),
+        handoffBreakdown: toChart(handoffCounts, handoffLabel),
+        dailyProcessed
       },
       systemStatus: {
         platformConnected: tokenCount > 0 || shop?.status === "demo",
@@ -1757,15 +2503,36 @@ app.get("/settings/feishu-webhook", async (req, res, next) => {
   try {
     const shopId = await resolveShopId(req);
     const raw = await getSetting<FeishuWebhookConfig>(shopId, "feishu_webhook");
-    const webhookUrl = raw?.webhookUrlEnc ? decryptSecret(raw.webhookUrlEnc) : "";
+    const webhookUrl = tryDecryptSecret(raw?.webhookUrlEnc);
     return sendJson(res, {
       success: true,
-      configured: Boolean(webhookUrl),
+      configured: Boolean(raw?.webhookUrlEnc),
       webhookUrlMasked: maskUrl(webhookUrl),
+      decryptable: !raw?.webhookUrlEnc || Boolean(webhookUrl),
       secretConfigured: Boolean(raw?.secretEnc),
       enabled: raw?.enabled !== false && Boolean(webhookUrl),
       notifyPresale: raw?.notifyPresale !== false,
       notifyAftersale: raw?.notifyAftersale !== false
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.delete("/settings/feishu-webhook", async (req, res, next) => {
+  try {
+    const shopId = await resolveShopId(req, req.body?.shopId || req.query.shopId);
+    await prisma.settingsRule.deleteMany({ where: { shopId, key: "feishu_webhook" } });
+    await createOperationLog(req, { shopId, action: "settings.feishu_webhook.delete", targetType: "settings_rule" });
+    return sendJson(res, {
+      success: true,
+      configured: false,
+      webhookUrlMasked: "",
+      decryptable: true,
+      secretConfigured: false,
+      enabled: false,
+      notifyPresale: true,
+      notifyAftersale: true
     });
   } catch (error) {
     return next(error);
@@ -1792,7 +2559,8 @@ app.post("/settings/feishu-webhook", async (req, res, next) => {
     return sendJson(res, {
       success: true,
       configured: true,
-      webhookUrlMasked: maskUrl(webhookUrl || (current?.webhookUrlEnc ? decryptSecret(current.webhookUrlEnc) : "")),
+      webhookUrlMasked: maskUrl(webhookUrl || tryDecryptSecret(current?.webhookUrlEnc)),
+      decryptable: true,
       secretConfigured: Boolean(value.secretEnc),
       enabled: value.enabled,
       notifyPresale: value.notifyPresale,
@@ -1826,7 +2594,7 @@ app.get("/settings/automation", async (req, res, next) => {
     return sendJson(res, {
       success: true,
       policy: {
-        autoReplyMode: policy?.autoReplyMode || "all_templates",
+        autoReplyMode: policy?.autoReplyMode || "low_risk_templates_only",
         bulkApproveLowRisk: policy?.bulkApproveLowRisk !== false,
         requireHumanForHighRisk: Boolean(policy?.requireHumanForHighRisk)
       }
@@ -1842,7 +2610,7 @@ app.post("/settings/automation", async (req, res, next) => {
     const mode = normalizeText(req.body?.autoReplyMode) as AutomationPolicy["autoReplyMode"];
     const allowed = new Set(["off", "low_risk_templates_only", "all_templates"]);
     const policy: AutomationPolicy = {
-      autoReplyMode: allowed.has(mode || "") ? mode : "all_templates",
+      autoReplyMode: allowed.has(mode || "") ? mode : "low_risk_templates_only",
       bulkApproveLowRisk: req.body?.bulkApproveLowRisk === undefined ? true : Boolean(req.body.bulkApproveLowRisk),
       requireHumanForHighRisk: req.body?.requireHumanForHighRisk === undefined ? false : Boolean(req.body.requireHumanForHighRisk)
     };
@@ -1878,24 +2646,29 @@ app.post("/reply-templates", async (req, res, next) => {
     const category = normalizeText(req.body?.category || intentCode);
     const content = String(req.body?.content || "").trim();
     if (!name || !intentCode || !content) throw new HttpError(400, "name, intentCode and content are required");
+    const language = normalizeText(req.body?.language) || "es-MX";
+    const scenario = normalizeText(req.body?.scenario) || "售后处理";
+    const active = req.body?.active === undefined ? true : Boolean(req.body.active);
 
     const latest = await prisma.replyTemplate.findFirst({
       where: { shopId, name },
       orderBy: { version: "desc" }
     });
     const version = latest ? latest.version + 1 : 1;
+    await assertNoActiveReplyTemplateConflict({ shopId, intentCode, language, scenario, active });
     const template = await prisma.replyTemplate.create({
       data: {
         shopId,
         name,
         intentCode,
         category,
-        language: normalizeText(req.body?.language) || "es-MX",
-        scenario: normalizeText(req.body?.scenario) || "售后处理",
+        language,
+        scenario,
         keywords: Array.isArray(req.body?.keywords) ? req.body.keywords.map((item: unknown) => normalizeText(item)).filter(Boolean) : [],
         content,
         variables: Array.isArray(req.body?.variables) ? req.body.variables.map((item: unknown) => normalizeText(item)).filter(Boolean) : [],
         requiresReview: req.body?.requiresReview === undefined ? true : Boolean(req.body.requiresReview),
+        active,
         version
       }
     });
@@ -1912,9 +2685,18 @@ app.post("/reply-templates/:id/toggle", async (req, res, next) => {
     const shopId = await resolveShopId(req, req.body?.shopId);
     const existing = await prisma.replyTemplate.findFirst({ where: { id: String(req.params.id), shopId } });
     if (!existing) throw new HttpError(404, "reply template not found");
+    const active = req.body?.active === undefined ? !existing.active : Boolean(req.body.active);
+    await assertNoActiveReplyTemplateConflict({
+      shopId,
+      id: existing.id,
+      intentCode: existing.intentCode,
+      language: existing.language,
+      scenario: existing.scenario,
+      active
+    });
     const template = await prisma.replyTemplate.update({
       where: { id: existing.id },
-      data: { active: req.body?.active === undefined ? !existing.active : Boolean(req.body.active) }
+      data: { active }
     });
     await createOperationLog(req, { shopId, action: "reply_template.toggle", targetType: "reply_template", targetId: template.id, detail: { active: template.active } });
     return sendJson(res, { success: true, template });
@@ -1929,18 +2711,23 @@ app.patch("/reply-templates/:id", async (req, res, next) => {
     const template = await prisma.replyTemplate.findFirst({ where: { id: String(req.params.id), shopId } });
     if (!template) throw new HttpError(404, "reply template not found");
     const content = String(req.body?.content ?? template.content);
+    const intentCode = normalizeText(req.body?.intentCode) || template.intentCode;
+    const language = normalizeText(req.body?.language) || template.language;
+    const scenario = req.body?.scenario === undefined ? template.scenario : normalizeText(req.body?.scenario);
+    const active = req.body?.active === undefined ? template.active : Boolean(req.body.active);
+    await assertNoActiveReplyTemplateConflict({ shopId, id: template.id, intentCode, language, scenario, active });
     const updated = await prisma.replyTemplate.update({
       where: { id: template.id },
       data: {
         name: normalizeText(req.body?.name) || template.name,
-        intentCode: normalizeText(req.body?.intentCode) || template.intentCode,
-        category: normalizeText(req.body?.category) || normalizeText(req.body?.intentCode) || template.category,
-        language: normalizeText(req.body?.language) || template.language,
-        scenario: req.body?.scenario === undefined ? template.scenario : normalizeText(req.body?.scenario),
+        intentCode,
+        category: normalizeText(req.body?.category) || intentCode || template.category,
+        language,
+        scenario,
         keywords: Array.isArray(req.body?.keywords) ? req.body.keywords.map((keyword: unknown) => normalizeText(keyword)).filter(Boolean) : template.keywords,
         content,
         variables: Array.isArray(req.body?.variables) ? req.body.variables.map((item: unknown) => normalizeText(item)).filter(Boolean) : template.variables,
-        active: req.body?.active === undefined ? template.active : Boolean(req.body.active),
+        active,
         version: content !== template.content ? template.version + 1 : template.version
       }
     });
@@ -1988,17 +2775,71 @@ app.get("/kb/skus", async (req, res, next) => {
 app.post("/kb/skus/import", async (req, res, next) => {
   try {
     const shopId = await resolveShopId(req, req.body?.shopId);
-    const rows = Array.isArray(req.body?.items) ? req.body.items : parseSkuCsv(decodeCsvPayload(req.body));
+    const parsedRows = parseSkuImportRows(req.body);
+    const rowMap = new Map<string, Record<string, unknown>>();
+    for (const row of parsedRows) {
+      const sku = mapSkuInput(row as Record<string, unknown>).sku;
+      if (sku) rowMap.set(sku, row as Record<string, unknown>);
+    }
+    const rows = [...rowMap.values()];
     if (!rows.length) throw new HttpError(400, "No SKU rows found");
 
-    const results = await prisma.$transaction(async () => {
+    await ensureVectorSchema();
+    const results = await prisma.$transaction(async (tx) => {
       const imported = [];
-      for (const row of rows) imported.push(await upsertSkuKnowledge(shopId, row as Record<string, unknown>));
-      return imported;
-    });
+      const chunkInputs: Array<{
+        documentId: string;
+        shopId: string;
+        content: string;
+        metadata: Prisma.InputJsonValue;
+        scoreHint?: number;
+      }> = [];
 
-    await createOperationLog(req, { shopId, action: "kb.sku.import", targetType: "sku_knowledge", detail: { count: results.length, ip: getClientIp(req) } });
-    return sendJson(res, { success: true, count: results.length, skus: results });
+      for (const row of rows) {
+        const sku = await upsertSkuKnowledge(shopId, row as Record<string, unknown>, tx);
+        const title = `SKU ${sku.sku}`;
+        const content = skuKnowledgeContent(sku);
+        const plan = fallbackChunkPlan(title, "product", content, sku.sku);
+        const existing = await tx.kbDocument.findMany({ where: { shopId, docType: "product", title } });
+        if (existing.length) await tx.kbDocument.deleteMany({ where: { id: { in: existing.map((document) => document.id) } } });
+        const document = await tx.kbDocument.create({
+          data: {
+            shopId,
+            title,
+            docType: "product",
+            content,
+            locale: sku.locale || "es-MX",
+            status: "indexed"
+          }
+        });
+        for (const chunk of plan.chunks) {
+          chunkInputs.push({
+            documentId: document.id,
+            shopId,
+            content: chunk.content,
+            metadata: safeJson({
+              title: chunk.title,
+              doc_type: chunk.doc_type,
+              sku_tags: [sku.sku],
+              intent_tags: ["presale", "product"],
+              risk_tags: chunk.risk_tags,
+              source_title: title,
+              source: "sku_import",
+              skuKnowledgeId: sku.id,
+              category: sku.category
+            }) as Prisma.InputJsonValue,
+            scoreHint: chunk.priority
+          });
+        }
+        imported.push(sku);
+      }
+
+      await createChunksWithEmbeddings(tx, chunkInputs);
+      return imported;
+    }, { timeout: 120_000 });
+
+    await createOperationLog(req, { shopId, action: "kb.sku.import", targetType: "sku_knowledge", detail: { count: results.length, indexed: true, ip: getClientIp(req) } });
+    return sendJson(res, { success: true, count: results.length, indexed: results.length, skus: results });
   } catch (error) {
     return next(error);
   }
@@ -2020,18 +2861,20 @@ app.delete("/kb/skus/:id", async (req, res, next) => {
 app.post("/kb/documents/import", async (req, res, next) => {
   try {
     const shopId = await resolveShopId(req, req.body?.shopId);
-    const title = normalizeText(req.body?.title);
+    const parsedFile = await parseKnowledgeDocumentFile(req.body);
+    const title = normalizeText(req.body?.title) || parsedFile?.title || "";
     const docType = normalizeText(req.body?.docType) || "faq";
-    const content = String(req.body?.content || "").trim();
+    const content = (parsedFile?.content || String(req.body?.content || "")).trim();
     const sku = normalizeText(req.body?.sku);
     const locale = normalizeText(req.body?.locale) || "es-MX";
-    if (!title || !content) throw new HttpError(400, "title and content are required");
+    if (!title) throw new HttpError(400, "请填写资料名称，或上传带文件名的资料文件");
+    if (!content) throw new HttpError(400, "请填写资料内容，或上传 TXT/PDF/DOCX 文件");
 
     const plan = await agenticChunkDocument({ title, docType, content, sku });
+    await ensureVectorSchema();
     const result = await prisma.$transaction(async (tx) => {
       const document = await tx.kbDocument.create({ data: { shopId, title, docType, content, locale, status: "indexed" } });
-      await tx.kbChunk.createMany({
-        data: plan.chunks.map((chunk) => ({
+      await createChunksWithEmbeddings(tx, plan.chunks.map((chunk) => ({
           documentId: document.id,
           shopId,
           content: chunk.content,
@@ -2044,13 +2887,21 @@ app.post("/kb/documents/import", async (req, res, next) => {
             source_title: title
           }) as Prisma.InputJsonValue,
           scoreHint: chunk.priority
-        }))
-      });
+        })));
       return { document, chunks: plan.chunks };
-    });
+    }, { timeout: 120_000 });
 
-    await createOperationLog(req, { shopId, action: "kb.document.import", targetType: "kb_document", targetId: result.document.id, detail: { chunks: result.chunks.length, ai: aiConfigured(), provider: selectedAiProvider() } });
-    return sendJson(res, { success: true, ...result });
+    const parsedFileSummary = parsedFile
+      ? { fileName: parsedFile.fileName, type: parsedFile.type, characters: parsedFile.characters }
+      : undefined;
+    await createOperationLog(req, {
+      shopId,
+      action: "kb.document.import",
+      targetType: "kb_document",
+      targetId: result.document.id,
+      detail: { chunks: result.chunks.length, ai: aiConfigured(), provider: selectedAiProvider(), parsedFile: parsedFileSummary }
+    });
+    return sendJson(res, { success: true, ...result, parsedFile: parsedFileSummary });
   } catch (error) {
     return next(error);
   }
@@ -2090,20 +2941,19 @@ app.patch("/kb/documents/:id", async (req, res, next) => {
     if (!title || !content) throw new HttpError(400, "title and content are required");
     const sku = normalizeText(req.body?.sku);
     const plan = await agenticChunkDocument({ title, docType, content, sku });
+    await ensureVectorSchema();
     const result = await prisma.$transaction(async (tx) => {
       const document = await tx.kbDocument.update({ where: { id: existing.id }, data: { title, docType, content, locale: normalizeText(req.body?.locale) || existing.locale, status: "indexed", active: req.body?.active === undefined ? existing.active : Boolean(req.body.active) } });
       await tx.kbChunk.deleteMany({ where: { documentId: existing.id } });
-      await tx.kbChunk.createMany({
-        data: plan.chunks.map((chunk) => ({
+      await createChunksWithEmbeddings(tx, plan.chunks.map((chunk) => ({
           documentId: existing.id,
           shopId,
           content: chunk.content,
           metadata: safeJson({ title: chunk.title, doc_type: chunk.doc_type, sku_tags: chunk.sku_tags, intent_tags: chunk.intent_tags, risk_tags: chunk.risk_tags, source_title: title }) as Prisma.InputJsonValue,
           scoreHint: chunk.priority
-        }))
-      });
+        })));
       return document;
-    });
+    }, { timeout: 120_000 });
     await createOperationLog(req, { shopId, action: "kb.document.update", targetType: "kb_document", targetId: existing.id, detail: { chunks: plan.chunks.length } });
     return sendJson(res, { success: true, document: result, chunks: plan.chunks });
   } catch (error) {
@@ -2342,8 +3192,16 @@ app.post("/presale/questions/:id/send", async (req, res, next) => {
 app.get("/aftersale/threads", async (req, res, next) => {
   try {
     const shopId = await resolveShopId(req);
-    const threads = await prisma.aftersaleThread.findMany({ where: { shopId }, include: { messages: { orderBy: { messageDate: "asc" }, take: 10 } }, orderBy: { updatedAt: "desc" }, take: 100 });
-    return sendJson(res, { success: true, threads });
+    const threads = await prisma.aftersaleThread.findMany({
+      where: { shopId },
+      include: {
+        messages: { orderBy: { messageDate: "asc" }, take: 30 },
+        _count: { select: { messages: true } }
+      },
+      orderBy: { updatedAt: "desc" },
+      take: 100
+    });
+    return sendJson(res, { success: true, threads: threads.map(withAftersaleComputedFields) });
   } catch (error) {
     return next(error);
   }
@@ -2352,14 +3210,22 @@ app.get("/aftersale/threads", async (req, res, next) => {
 app.post("/aftersale/threads/:id/analyze", async (req, res, next) => {
   try {
     const shopId = await resolveShopId(req, req.body?.shopId);
-    const thread = await prisma.aftersaleThread.findFirst({ where: { id: String(req.params.id), shopId }, include: { messages: { orderBy: { messageDate: "desc" }, take: 8 } } });
+    const thread = await prisma.aftersaleThread.findFirst({
+      where: { id: String(req.params.id), shopId },
+      include: {
+        messages: { orderBy: { messageDate: "desc" }, take: 20 },
+        _count: { select: { messages: true } }
+      }
+    });
     if (!thread) throw new HttpError(404, "thread not found");
 
     const rawContext = (thread.rawContext || {}) as Record<string, unknown>;
     const sku = normalizeText(rawContext.sku);
     const latestMessage = normalizeText(req.body?.latestMessage) || thread.messages[0]?.text || normalizeText(rawContext.latestMessage);
+    const conversationHistory = thread.messages.slice().reverse().map((message) => normalizeText(message.text)).filter(Boolean);
     const analysis = await generateAftersaleWithAi({
       latestMessage,
+      conversationHistory,
       orderStatus: normalizeText(rawContext.orderStatus),
       shipmentStatus: normalizeText(rawContext.shipmentStatus),
       hasClaim: Boolean(thread.claimId || rawContext.claimId),
@@ -2380,21 +3246,47 @@ app.post("/aftersale/threads/:id/analyze", async (req, res, next) => {
         estimatedDeliveryDate: rawContext.estimatedDeliveryDate
       })
       : analysis.suggested_reply_es_mx;
+    const handoff = decideAftersaleHandoff({ category: analysis.category, shouldEscalate: analysis.should_escalate_to_human });
 
     const updated = await prisma.aftersaleThread.update({
       where: { id: thread.id },
-      data: { category: analysis.category, riskLevel: analysis.risk_level, summary: analysis.summary_zh, suggestedAction: analysis.suggested_action_zh, suggestedReply }
+      data: {
+        status: handoff.required ? "human_pending" : "open",
+        category: analysis.category,
+        riskLevel: analysis.risk_level,
+        summary: analysis.summary_zh,
+        suggestedAction: analysis.suggested_action_zh,
+        suggestedReply
+      }
     });
-    const shouldNotifyHuman = analysis.should_escalate_to_human || analysis.category === "human_request";
-    const feishuResult = shouldNotifyHuman
-      ? await notifyFeishuSafely(shopId, [
-        "[Mercado Libre] 售后转人工请求",
-        `Pack: ${thread.packId.toString()}`,
-        `Order: ${thread.orderId?.toString() || "-"}`,
-        `Buyer message: ${latestMessage}`,
-        `Auto reply: ${suggestedReply}`
-      ].join("\n"))
+    const shop = await prisma.shop.findUnique({ where: { id: shopId } });
+    const feishuResult = handoff.required
+      ? await notifyFeishuSafely(shopId, buildAftersaleHandoffNotice({
+        shopName: shop?.nickname,
+        handoff,
+        packId: thread.packId.toString(),
+        orderId: thread.orderId?.toString(),
+        buyerMessage: latestMessage,
+        conversationText: conversationHistory.join("\n"),
+        suggestedAction: analysis.suggested_action_zh,
+        suggestedReply
+      }))
       : null;
+    if (handoff.required && req.body?.dispatch === true) {
+      const now = new Date();
+      await prisma.message.create({
+        data: {
+          shopId,
+          threadId: thread.id,
+          meliMessageId: `system-handoff-${thread.id}-${now.getTime()}`,
+          packId: thread.packId,
+          direction: "system",
+          text: `已通过飞书提醒人工处理：${handoff.label || handoff.reason || "转人工"}`,
+          rawMessage: safeJson({ source: "system_handoff", handoff, feishuResult }) as Prisma.InputJsonValue,
+          messageDate: now
+        }
+      });
+    }
     await prisma.aiSuggestion.create({
       data: {
         shopId,
@@ -2403,13 +3295,20 @@ app.post("/aftersale/threads/:id/analyze", async (req, res, next) => {
         model: selectedAiProvider() || "local_rules",
         promptVersion: aiPromptVersion("aftersale"),
         inputSnapshot: safeJson({ thread, latestMessage, sku, knowledgeScope: "aftersale_templates_only" }) as unknown as Prisma.InputJsonValue,
-        outputJson: safeJson({ ...analysis, matchedTemplate: matchedTemplate ? { id: matchedTemplate.id, name: matchedTemplate.name } : null, feishuResult }) as unknown as Prisma.InputJsonValue,
+        outputJson: safeJson({ ...analysis, handoff, matchedTemplate: matchedTemplate ? { id: matchedTemplate.id, name: matchedTemplate.name } : null, feishuResult }) as unknown as Prisma.InputJsonValue,
         outputText: suggestedReply,
         riskFlags: analysis.forbidden_commitments_detected
       }
     });
 
-    return sendJson(res, { success: true, thread: updated, analysis, suggestedReply, matchedTemplate, feishuResult, ragHits: [] });
+    const refreshedThread = await prisma.aftersaleThread.findUnique({
+      where: { id: thread.id },
+      include: {
+        messages: { orderBy: { messageDate: "asc" }, take: 30 },
+        _count: { select: { messages: true } }
+      }
+    });
+    return sendJson(res, { success: true, thread: refreshedThread ? withAftersaleComputedFields(refreshedThread) : withAftersaleComputedFields({ ...updated, messages: thread.messages.slice().reverse(), _count: thread._count }), analysis, handoff, suggestedReply, matchedTemplate, feishuResult, ragHits: [] });
   } catch (error) {
     return next(error);
   }
@@ -2418,13 +3317,34 @@ app.post("/aftersale/threads/:id/analyze", async (req, res, next) => {
 app.post("/aftersale/threads/:id/send", async (req, res, next) => {
   try {
     const shopId = await resolveShopId(req, req.body?.shopId);
-    const dryRun = req.body?.dryRun !== false || process.env.AUTO_SEND_AFTERSALE !== "true";
+    const wantsRealSend = req.body?.dryRun === false;
+    if (wantsRealSend && process.env.AUTO_SEND_AFTERSALE !== "true") {
+      throw new HttpError(409, "Real Mercado Libre post-sale send is disabled. Set AUTO_SEND_AFTERSALE=true after OAuth and audit checks are ready.");
+    }
+    const dryRun = !wantsRealSend;
     const thread = await prisma.aftersaleThread.findFirst({ where: { id: String(req.params.id), shopId } });
     if (!thread) throw new HttpError(404, "thread not found");
     const replyText = String(req.body?.replyText || thread.suggestedReply || "").trim();
     if (!replyText) throw new HttpError(400, "replyText is required");
 
     if (dryRun) {
+      const now = new Date();
+      const outboundMessage = await prisma.message.create({
+        data: {
+          shopId,
+          threadId: thread.id,
+          meliMessageId: `dry-run-aftersale-${thread.id}-${now.getTime()}`,
+          packId: thread.packId,
+          direction: "outbound",
+          text: replyText,
+          rawMessage: safeJson({ source: "dry_run", replyText }) as Prisma.InputJsonValue,
+          messageDate: now
+        }
+      });
+      await prisma.aftersaleThread.update({
+        where: { id: thread.id },
+        data: { suggestedReply: replyText, lastMessageAt: now }
+      });
       await createOperationLog(req, {
         shopId,
         action: "aftersale.send.dry_run",
@@ -2432,10 +3352,61 @@ app.post("/aftersale/threads/:id/send", async (req, res, next) => {
         targetId: thread.id,
         detail: { packId: thread.packId.toString(), orderId: thread.orderId?.toString(), replyText }
       });
-      return sendJson(res, { success: true, dryRun: true, message: "Reply recorded as dry run. Real Mercado Libre message send is not enabled yet." });
+      const updatedThread = await prisma.aftersaleThread.findUnique({
+        where: { id: thread.id },
+        include: {
+          messages: { orderBy: { messageDate: "asc" }, take: 30 },
+          _count: { select: { messages: true } }
+        }
+      });
+      return sendJson(res, {
+        success: true,
+        dryRun: true,
+        message: "Reply recorded as dry run. Real Mercado Libre message send is not enabled yet.",
+        outboundMessage,
+        thread: updatedThread ? withAftersaleComputedFields(updatedThread) : null
+      });
     }
 
-    return sendJson(res, { success: false, message: "Real Mercado Libre post-sale message send is not enabled yet. OAuth, message endpoint mapping and audit checks are required." }, 501);
+    const meliResult = await postMeliPackMessage(shopId, thread.packId, replyText);
+    const now = new Date();
+    const outboundMessage = await prisma.message.create({
+      data: {
+        shopId,
+        threadId: thread.id,
+        meliMessageId: `meli-aftersale-${thread.id}-${now.getTime()}`,
+        packId: thread.packId,
+        direction: "outbound",
+        text: replyText,
+        rawMessage: safeJson({ source: "mercado_libre", meliResult }) as Prisma.InputJsonValue,
+        messageDate: now
+      }
+    });
+    await prisma.aftersaleThread.update({
+      where: { id: thread.id },
+      data: { suggestedReply: replyText, status: "closed", lastMessageAt: now }
+    });
+    await createOperationLog(req, {
+      shopId,
+      action: "aftersale.send.real",
+      targetType: "aftersale_thread",
+      targetId: thread.id,
+      detail: { packId: thread.packId.toString(), orderId: thread.orderId?.toString() }
+    });
+    const updatedThread = await prisma.aftersaleThread.findUnique({
+      where: { id: thread.id },
+      include: {
+        messages: { orderBy: { messageDate: "asc" }, take: 30 },
+        _count: { select: { messages: true } }
+      }
+    });
+    return sendJson(res, {
+      success: true,
+      dryRun: false,
+      outboundMessage,
+      thread: updatedThread ? withAftersaleComputedFields(updatedThread) : null,
+      meliResult
+    });
   } catch (error) {
     return next(error);
   }
@@ -2476,12 +3447,12 @@ app.get("/reply-reviews", async (req, res, next) => {
     const shopId = await resolveShopId(req);
     const [questions, threads] = await Promise.all([
       prisma.presaleQuestion.findMany({
-        where: { shopId, reviewStatus: { in: ["draft_ready", "needs_human", "approved", "dry_run_sent"] } },
+        where: { shopId, reviewStatus: { in: ["draft_ready", "needs_human"] } },
         orderBy: { updatedAt: "desc" },
         take: 100
       }),
       prisma.aftersaleThread.findMany({
-        where: { shopId, suggestedReply: { not: null } },
+        where: { shopId, suggestedReply: { not: null }, status: { in: ["open", "human_pending"] } },
         include: { messages: { orderBy: { messageDate: "desc" }, take: 1 } },
         orderBy: { updatedAt: "desc" },
         take: 100
@@ -2493,6 +3464,7 @@ app.get("/reply-reviews", async (req, res, next) => {
         const rawItem = (question.rawItem || {}) as Record<string, unknown>;
         return {
           id: question.id,
+          targetType: "presale_question",
           source: "买家咨询",
           status: question.reviewStatus,
           buyerQuestion: question.questionText,
@@ -2505,6 +3477,7 @@ app.get("/reply-reviews", async (req, res, next) => {
       }),
       ...threads.map((thread) => ({
         id: thread.id,
+        targetType: "aftersale_thread",
         source: "售后处理",
         status: thread.status,
         buyerQuestion: thread.messages[0]?.text || normalizeText((thread.rawContext || {}) as Record<string, unknown>),
