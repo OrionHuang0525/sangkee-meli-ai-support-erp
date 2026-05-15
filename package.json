@@ -12,7 +12,11 @@
     "lint": "corepack pnpm -r lint",
     "db:generate": "corepack pnpm --filter @meli-ai-support/db prisma:generate",
     "db:migrate": "corepack pnpm --filter @meli-ai-support/db prisma:migrate",
-    "db:studio": "corepack pnpm --filter @meli-ai-support/db prisma:studio"
+    "db:migrate:deploy": "corepack pnpm --filter @meli-ai-support/db prisma:migrate:deploy",
+    "db:migrate:baseline": "corepack pnpm --filter @meli-ai-support/db prisma:migrate:baseline",
+    "db:migrate:status": "corepack pnpm --filter @meli-ai-support/db prisma:migrate:status",
+    "db:studio": "corepack pnpm --filter @meli-ai-support/db prisma:studio",
+    "smoke:api": "node scripts/smoke/api-bridge.mjs"
   },
   "packageManager": "pnpm@9.15.4",
   "engines": {

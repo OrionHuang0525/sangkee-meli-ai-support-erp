@@ -29,6 +29,10 @@ const MELI_AUTH_URL = process.env.MELI_AUTH_URL || "https://global-selling.merca
 const MELI_TOKEN_URL = "https://api.mercadolibre.com/oauth/token";
 const DEMO_SELLER_ID = BigInt("900000000001");
 const KB_MAX_FILE_BYTES = 15 * 1024 * 1024;
+const STARTED_AT = new Date();
+const READINESS_CORE_ENV = ["DATABASE_URL", "REDIS_URL", "TOKEN_ENCRYPTION_KEY"] as const;
+const READINESS_EXTERNAL_ENV = ["MELI_CLIENT_ID", "MELI_CLIENT_SECRET", "MELI_REDIRECT_URI", "WEBHOOK_SHARED_SECRET"] as const;
+const READINESS_STRICT_EXTERNAL = process.env.READINESS_STRICT_EXTERNAL === "true";
 
 const redis = new Redis(REDIS_URL, { maxRetriesPerRequest: null });
 const webhookQueue = new Queue("meli-webhook-events", { connection: redis });
@@ -71,6 +75,68 @@ function requireEnv(name: string): string {
   const value = optionalEnv(name);
   if (!value) throw new HttpError(400, `Missing environment variable ${name}`);
   return value;
+}
+
+async function checkWithTimeout(name: string, check: () => Promise<unknown>, timeoutMs = 1500) {
+  const startedAt = Date.now();
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      check(),
+      new Promise((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error(`${name} check timed out after ${timeoutMs}ms`)), timeoutMs);
+      })
+    ]);
+    return { ok: true, latencyMs: Date.now() - startedAt };
+  } catch (error) {
+    return {
+      ok: false,
+      latencyMs: Date.now() - startedAt,
+      message: error instanceof Error ? error.message : String(error)
+    };
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+function checkEnvironment() {
+  const missingCore = READINESS_CORE_ENV.filter((name) => !optionalEnv(name));
+  const missingExternal = READINESS_EXTERNAL_ENV.filter((name) => !optionalEnv(name));
+  let tokenEncryptionReady = false;
+  let tokenEncryptionMessage = "";
+  try {
+    tokenEncryptionReady = Boolean(getEncryptionKey());
+  } catch (error) {
+    tokenEncryptionMessage = error instanceof Error ? error.message : String(error);
+  }
+
+  return {
+    strictExternal: READINESS_STRICT_EXTERNAL,
+    missingCore,
+    missingExternal,
+    tokenEncryptionReady,
+    tokenEncryptionMessage: tokenEncryptionReady ? "" : tokenEncryptionMessage
+  };
+}
+
+async function buildReadiness() {
+  const [database, redisCheck] = await Promise.all([
+    checkWithTimeout("database", () => prisma.$queryRaw`SELECT 1`),
+    checkWithTimeout("redis", () => redis.ping())
+  ]);
+  const env = checkEnvironment();
+  const envReady = env.missingCore.length === 0
+    && env.tokenEncryptionReady
+    && (!env.strictExternal || env.missingExternal.length === 0);
+  const ready = database.ok && redisCheck.ok && envReady;
+
+  return {
+    ready,
+    service: "meli-ai-support-api",
+    startedAt: STARTED_AT.toISOString(),
+    uptimeSeconds: Math.round(process.uptime()),
+    checks: { database, redis: redisCheck, env: { ok: envReady, ...env } }
+  };
 }
 
 function normalizeText(value: unknown): string {
@@ -1884,28 +1950,50 @@ async function postMeliPackMessage(shopId: string, packId: bigint, text: string)
   }
 }
 
+app.get("/livez", (_req, res) => {
+  sendJson(res, {
+    success: true,
+    status: "alive",
+    service: "meli-ai-support-api",
+    startedAt: STARTED_AT.toISOString(),
+    uptimeSeconds: Math.round(process.uptime())
+  });
+});
+
+app.get("/readyz", async (_req, res) => {
+  const readiness = await buildReadiness();
+  sendJson(res, { success: readiness.ready, status: readiness.ready ? "ready" : "not_ready", ...readiness }, readiness.ready ? 200 : 503);
+});
+
 app.get("/health", async (req, res) => {
-  const shopId = await resolveShopId(req).catch(() => null);
+  const shopId = normalizeText(req.query.shopId);
+  const shopScoped = shopId ? { shopId } : {};
   const ai = getAiRuntimeConfig();
-  const [shopCount, pendingWebhookCount, skuCount, chunkCount, presalePending, aftersaleOpen] = await Promise.all([
+  const [readiness, shopCount, pendingWebhookCount, skuCount, chunkCount, presalePending, aftersaleOpen] = await Promise.all([
+    buildReadiness().catch((error) => ({ ready: false, checks: { error: error instanceof Error ? error.message : String(error) } })),
     prisma.shop.count().catch(() => -1),
     prisma.webhookEvent.count({ where: { status: "pending" } }).catch(() => -1),
-    shopId ? prisma.skuKnowledge.count({ where: { shopId } }).catch(() => -1) : Promise.resolve(0),
-    shopId ? prisma.kbChunk.count({ where: { shopId } }).catch(() => -1) : Promise.resolve(0),
-    shopId ? prisma.presaleQuestion.count({ where: { shopId, reviewStatus: "pending" } }).catch(() => -1) : Promise.resolve(0),
-    shopId ? prisma.aftersaleThread.count({ where: { shopId, status: "open" } }).catch(() => -1) : Promise.resolve(0)
+    prisma.skuKnowledge.count({ where: shopScoped }).catch(() => -1),
+    prisma.kbChunk.count({ where: shopScoped }).catch(() => -1),
+    prisma.presaleQuestion.count({ where: { ...shopScoped, reviewStatus: { in: ["pending", "draft_ready", "needs_human"] } } }).catch(() => -1),
+    prisma.aftersaleThread.count({ where: { ...shopScoped, status: { in: ["open", "human_pending"] } } }).catch(() => -1)
   ]);
 
   sendJson(res, {
     success: true,
+    status: readiness.ready ? "ok" : "degraded",
     service: "meli-ai-support-api",
     time: new Date().toISOString(),
+    startedAt: STARTED_AT.toISOString(),
+    uptimeSeconds: Math.round(process.uptime()),
+    shopScope: shopId || "all",
     shopCount,
     pendingWebhookCount,
     skuCount,
     chunkCount,
     presalePending,
     aftersaleOpen,
+    readiness,
     ai: {
       provider: ai.provider,
       configured: ai.configured,

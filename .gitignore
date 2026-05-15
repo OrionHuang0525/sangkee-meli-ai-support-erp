@@ -3,6 +3,9 @@ node_modules/
 dist/
 coverage/
 .env
+.env.*
+!.env.example
+!deploy/**/*.example
 .env.local
 *.log
 *.tsbuildinfo

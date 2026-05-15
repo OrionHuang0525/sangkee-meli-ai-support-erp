@@ -1,0 +1,78 @@
+name: meli-ai-support
+
+x-app-env: &app-env
+  env_file:
+    - ${ENV_FILE:-.env.prod}
+  restart: unless-stopped
+
+services:
+  migrate:
+    image: ${IMAGE_REGISTRY}/${IMAGE_NAMESPACE}/meli-ai-support-migrate:${IMAGE_TAG:-main-latest}
+    env_file:
+      - ${ENV_FILE:-.env.prod}
+    restart: "no"
+
+  api:
+    <<: *app-env
+    image: ${IMAGE_REGISTRY}/${IMAGE_NAMESPACE}/meli-ai-support-api:${IMAGE_TAG:-main-latest}
+    ports:
+      - "${API_BIND:-127.0.0.1}:${API_PORT:-3001}:3001"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3001/livez').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  worker:
+    <<: *app-env
+    image: ${IMAGE_REGISTRY}/${IMAGE_NAMESPACE}/meli-ai-support-worker:${IMAGE_TAG:-main-latest}
+    depends_on:
+      api:
+        condition: service_healthy
+
+  web:
+    <<: *app-env
+    image: ${IMAGE_REGISTRY}/${IMAGE_NAMESPACE}/meli-ai-support-web:${IMAGE_TAG:-main-latest}
+    ports:
+      - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-3000}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  postgres:
+    profiles: ["self-hosted-data"]
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      POSTGRES_DB: ${POSTGRES_DB:-meli_ai_support}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-meli_ai_support}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    profiles: ["self-hosted-data"]
+    image: redis:7
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
+  redis_data:

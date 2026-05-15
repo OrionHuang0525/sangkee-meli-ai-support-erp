@@ -1,0 +1,149 @@
+name: Deploy Volcengine
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy. Defaults to this workflow commit SHA."
+        required: false
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: deploy-volcengine-production
+  cancel-in-progress: false
+
+env:
+  IMAGE_TAG: ${{ inputs.image_tag || github.sha }}
+  IMAGE_REGISTRY: ${{ secrets.VOLCENGINE_CR_REGISTRY }}
+  IMAGE_NAMESPACE: ${{ secrets.VOLCENGINE_CR_NAMESPACE }}
+  ECS_HOST: ${{ secrets.VOLCENGINE_ECS_HOST }}
+  ECS_USER: ${{ secrets.VOLCENGINE_ECS_USER }}
+  ECS_PORT: ${{ secrets.VOLCENGINE_ECS_PORT || '22' }}
+  APP_DIR: ${{ secrets.VOLCENGINE_APP_DIR || '/opt/meli-ai-support' }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Volcengine CR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.IMAGE_REGISTRY }}
+          username: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+          password: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
+
+      - name: Build and push API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: api
+          push: true
+          tags: |
+            ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/meli-ai-support-api:${{ env.IMAGE_TAG }}
+            ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/meli-ai-support-api:main-latest
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+      - name: Build and push worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: worker
+          push: true
+          tags: |
+            ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/meli-ai-support-worker:${{ env.IMAGE_TAG }}
+            ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/meli-ai-support-worker:main-latest
+          cache-from: type=gha,scope=worker
+          cache-to: type=gha,mode=max,scope=worker
+
+      - name: Build and push web image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: web
+          push: true
+          tags: |
+            ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/meli-ai-support-web:${{ env.IMAGE_TAG }}
+            ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/meli-ai-support-web:main-latest
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
+
+      - name: Build and push migration image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: migrate
+          push: true
+          tags: |
+            ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/meli-ai-support-migrate:${{ env.IMAGE_TAG }}
+            ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/meli-ai-support-migrate:main-latest
+          cache-from: type=gha,scope=migrate
+          cache-to: type=gha,mode=max,scope=migrate
+
+      - name: Prepare SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.VOLCENGINE_ECS_SSH_KEY }}" > ~/.ssh/volcengine_key
+          chmod 600 ~/.ssh/volcengine_key
+          ssh-keyscan -p "$ECS_PORT" -H "$ECS_HOST" >> ~/.ssh/known_hosts
+
+      - name: Prepare deployment files
+        run: |
+          printf '%s\n' "${{ secrets.PROD_ENV_FILE }}" > .env.prod
+          cat > .env.deploy <<EOF
+          IMAGE_REGISTRY=$IMAGE_REGISTRY
+          IMAGE_NAMESPACE=$IMAGE_NAMESPACE
+          IMAGE_TAG=$IMAGE_TAG
+          ENV_FILE=.env.prod
+          WEB_BIND=${{ secrets.WEB_BIND || '127.0.0.1' }}
+          WEB_PORT=${{ secrets.WEB_PORT || '3000' }}
+          API_BIND=${{ secrets.API_BIND || '127.0.0.1' }}
+          API_PORT=${{ secrets.API_PORT || '3001' }}
+          API_HEALTH_URL=${{ secrets.API_HEALTH_URL || 'http://127.0.0.1:3001/readyz' }}
+          EOF
+
+      - name: Upload deployment files
+        run: |
+          ssh -i ~/.ssh/volcengine_key -p "$ECS_PORT" "$ECS_USER@$ECS_HOST" "mkdir -p '$APP_DIR/scripts/deploy/volcengine'"
+          scp -i ~/.ssh/volcengine_key -P "$ECS_PORT" docker-compose.prod.yml .env.prod .env.deploy "$ECS_USER@$ECS_HOST:$APP_DIR/"
+          scp -i ~/.ssh/volcengine_key -P "$ECS_PORT" scripts/deploy/volcengine/*.sh "$ECS_USER@$ECS_HOST:$APP_DIR/scripts/deploy/volcengine/"
+
+      - name: Deploy on ECS
+        run: |
+          ssh -i ~/.ssh/volcengine_key -p "$ECS_PORT" "$ECS_USER@$ECS_HOST" "cd '$APP_DIR' && chmod +x scripts/deploy/volcengine/*.sh && APP_DIR='$APP_DIR' scripts/deploy/volcengine/deploy.sh '$IMAGE_TAG'"
+
+      - name: API smoke test
+        env:
+          SMOKE_API_URL: ${{ secrets.SMOKE_API_URL || secrets.API_HEALTH_BASE_URL }}
+          SMOKE_EXPECT_READY: "true"
+          SMOKE_POST_WEBHOOK: ${{ secrets.SMOKE_POST_WEBHOOK || 'false' }}
+          SMOKE_WEBHOOK_SECRET: ${{ secrets.SMOKE_WEBHOOK_SECRET || '' }}
+        run: |
+          if [ -n "$SMOKE_API_URL" ]; then
+            node scripts/smoke/api-bridge.mjs
+          else
+            echo "SMOKE_API_URL not configured; remote readyz was already checked on ECS."
+          fi
+
+      - name: Notify Feishu on failure
+        if: failure()
+        env:
+          FEISHU_DEPLOY_WEBHOOK: ${{ secrets.FEISHU_DEPLOY_WEBHOOK }}
+        run: |
+          if [ -n "$FEISHU_DEPLOY_WEBHOOK" ]; then
+            curl -fsS "$FEISHU_DEPLOY_WEBHOOK" \
+              -H "Content-Type: application/json" \
+              -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"Meli AI Support deploy failed: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\"}}"
+          fi
