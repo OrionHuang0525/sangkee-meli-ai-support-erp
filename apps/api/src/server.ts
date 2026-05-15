@@ -2199,7 +2199,7 @@ app.get("/dashboard", async (req, res, next) => {
         where: {
           shopId,
           createdAt: { gte: weekStart },
-          action: { in: ["presale.send.dry_run", "presale.send.real", "aftersale.send.dry_run", "aftersale.close"] }
+          action: { in: ["presale.send.dry_run", "presale.send.real", "aftersale.send.dry_run", "aftersale.send.local_record", "aftersale.close"] }
         },
         select: { createdAt: true },
         take: 1000
@@ -3419,6 +3419,7 @@ app.post("/aftersale/threads/:id/send", async (req, res, next) => {
 
     if (dryRun) {
       const now = new Date();
+      const localSource = allowLocalRecord ? "manual_local_record" : "dry_run";
       const outboundMessage = await prisma.message.create({
         data: {
           shopId,
@@ -3427,7 +3428,7 @@ app.post("/aftersale/threads/:id/send", async (req, res, next) => {
           packId: thread.packId,
           direction: "outbound",
           text: replyText,
-          rawMessage: safeJson({ source: "dry_run", replyText }) as Prisma.InputJsonValue,
+          rawMessage: safeJson({ source: localSource, replyText }) as Prisma.InputJsonValue,
           messageDate: now
         }
       });
@@ -3437,7 +3438,7 @@ app.post("/aftersale/threads/:id/send", async (req, res, next) => {
       });
       await createOperationLog(req, {
         shopId,
-        action: "aftersale.send.dry_run",
+        action: allowLocalRecord ? "aftersale.send.local_record" : "aftersale.send.dry_run",
         targetType: "aftersale_thread",
         targetId: thread.id,
         detail: { packId: thread.packId.toString(), orderId: thread.orderId?.toString(), replyText }
@@ -3452,7 +3453,8 @@ app.post("/aftersale/threads/:id/send", async (req, res, next) => {
       return sendJson(res, {
         success: true,
         dryRun: true,
-        message: "Reply recorded as dry run. Real Mercado Libre message send is not enabled yet.",
+        localRecord: allowLocalRecord,
+        message: allowLocalRecord ? "Reply recorded locally because real Mercado Libre message send is not enabled yet." : "Reply recorded as dry run. Real Mercado Libre message send is not enabled yet.",
         outboundMessage,
         thread: updatedThread ? withAftersaleComputedFields(updatedThread) : null
       });

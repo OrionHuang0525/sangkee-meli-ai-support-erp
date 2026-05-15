@@ -116,10 +116,23 @@ function messageRole(message: AnyRecord) {
   return "customer";
 }
 
-function messageRoleText(role: string) {
-  if (role === "assistant") return "客服/机器人回复";
+function isAftersaleHandoffThread(thread: unknown) {
+  return valueOf(thread, "handoffRequired") === "true" || ["human_request", "invoice_request", "other"].includes(valueOf(thread, "category"));
+}
+
+function messageRoleText(role: string, thread?: unknown) {
+  if (role === "assistant") return isAftersaleHandoffThread(thread) ? "客服人工回复" : "系统自动回复";
   if (role === "system") return "系统记录";
   return "买家消息";
+}
+
+function aftersaleReplyHeading(thread: unknown) {
+  if (!thread) return "待处理回复";
+  return isAftersaleHandoffThread(thread) ? "人工处理回复" : "已路由预设回复";
+}
+
+function aftersaleDraftLabel(thread: unknown) {
+  return isAftersaleHandoffThread(thread) ? "待发送人工回复" : "待发送自动回复";
 }
 
 function presaleReplyLabel(question: AnyRecord) {
@@ -702,7 +715,7 @@ export default function AppShell({ apiUrl }: AppShellProps) {
       setAftersaleReferences(asList(analyzed, "ragHits"));
       replyText = valueOf(thread, "suggestedReply").trim();
     }
-    if (!replyText) throw new Error("没有可发送的售后回复，请先维护对应预设回复。");
+    if (!replyText) throw new Error("没有可发送的售后回复，请先填写本次人工回复或维护对应预设回复。");
     const sent = await requestJson(apiUrl, `/aftersale/threads/${threadId}/send`, {
       method: "POST",
       body: JSON.stringify({ shopId: selectedShop, replyText, dryRun: false, allowLocalRecord: true })
@@ -984,14 +997,14 @@ export default function AppShell({ apiUrl }: AppShellProps) {
                       const role = messageRole(record);
                       return (
                         <div className={`bubble ${role}`} key={valueOf(record, "id")}>
-                          <div className="bubble-head"><span>{messageRoleText(role)}</span>{valueOf(record, "messageDate") ? <em>{displayDateTime(valueOf(record, "messageDate"))}</em> : null}</div>
+                          <div className="bubble-head"><span>{messageRoleText(role, selectedThread)}</span>{valueOf(record, "messageDate") ? <em>{displayDateTime(valueOf(record, "messageDate"))}</em> : null}</div>
                           <p>{valueOf(record, "text") || "-"}</p>
                         </div>
                       );
                     })}
                     {!asList(selectedThread, "messages").some((msg) => messageRole(msg as AnyRecord) === "assistant") && valueOf(selectedThread, "suggestedReply") ? (
                       <div className="bubble assistant draft">
-                        <div className="bubble-head"><span>待记录回复</span></div>
+                        <div className="bubble-head"><span>{aftersaleDraftLabel(selectedThread)}</span></div>
                         <p>{valueOf(selectedThread, "suggestedReply")}</p>
                       </div>
                     ) : null}
@@ -1000,20 +1013,20 @@ export default function AppShell({ apiUrl }: AppShellProps) {
               ) : <div className="empty-state">暂无售后消息</div>}
             </article>
             <aside className="assist-panel aftersale-composer">
-              <h2>售后自动回复</h2>
+              <h2>售后处理</h2>
               <div className="reply-status">
                 <strong>{valueOf(selectedThread, "handoffLabel") || statusText(valueOf(selectedThread, "category"))}</strong>
                 <span>{selectedThread ? `${statusText(valueOf(selectedThread, "status"))} · ${String(valueOf(selectedThread, "messageCount") || asList(selectedThread, "messages").length)} 条消息` : "-"}</span>
               </div>
-              <div className="info-card"><strong>问题类型：{statusText(valueOf(selectedThread, "category"))}</strong><p>{valueOf(selectedThread, "suggestedAction") || "售后消息进入后会自动识别意图并路由到预设回复。"}</p></div>
-              {valueOf(selectedThread, "suggestedReply") ? <div className="info-card"><strong>已路由预设回复</strong><p>{valueOf(selectedThread, "suggestedReply")}</p></div> : null}
-              <textarea className="reply-box" value={aftersaleReplyText} onChange={(event) => setAftersaleReplyText(event.target.value)} placeholder="发送前可编辑本次发送内容；开票和转人工场景会改为飞书提醒。" />
+              <div className="info-card"><strong>问题类型：{statusText(valueOf(selectedThread, "category"))}</strong><p>{valueOf(selectedThread, "suggestedAction") || "售后消息进入后会自动识别意图；需要人工的场景会进入人工处理。"}</p></div>
+              {valueOf(selectedThread, "suggestedReply") ? <div className="info-card"><strong>{aftersaleReplyHeading(selectedThread)}</strong><p>{valueOf(selectedThread, "suggestedReply")}</p></div> : null}
+              <textarea className="reply-box" value={aftersaleReplyText} onChange={(event) => setAftersaleReplyText(event.target.value)} placeholder={isAftersaleHandoffThread(selectedThread) ? "这里填写客服人工回复；发送后会同步到对话并关闭当前待处理项。" : "发送前可编辑本次自动回复内容。"} />
               <h3>处理依据</h3>
               <ul className="plain-list">
-                <li>售后分析不使用售前回复依据，优先使用订单上下文、风险规则和预设回复。</li>
+                <li>售后分析不使用售前回复依据，优先使用订单上下文、风险规则和售后处理规则。</li>
                 {valueOf(selectedThread, "category") ? <li>当前分类：{statusText(valueOf(selectedThread, "category"))}</li> : null}
-                {valueOf(selectedThread, "category") === "human_request" ? <li>买家明确要求转人工，系统会先自动安抚并通过飞书提醒售后客服。</li> : null}
-                {valueOf(selectedThread, "category") === "invoice_request" ? <li>开票问题会先收集必要开票资料，同时通过飞书提醒人工处理。</li> : null}
+                {valueOf(selectedThread, "category") === "human_request" ? <li>买家明确要求转人工，本区显示的是客服人工回复，不属于预设回复路由。</li> : null}
+                {valueOf(selectedThread, "category") === "invoice_request" ? <li>开票问题需要人工核对资料，本区显示的是人工处理回复，并通过飞书提醒客服。</li> : null}
                 {valueOf(selectedThread, "category") === "other" ? <li>未识别问题不自动回复，通过飞书提醒人工处理。</li> : null}
                 {valueOf(selectedThread, "category") && !["human_request", "invoice_request", "other"].includes(valueOf(selectedThread, "category")) ? <li>该类型按预设回复自动处理，不额外转人工。</li> : null}
               </ul>
