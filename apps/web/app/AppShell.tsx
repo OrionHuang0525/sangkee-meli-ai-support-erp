@@ -292,6 +292,7 @@ export default function AppShell({ apiUrl }: AppShellProps) {
   const [autoMode, setAutoMode] = useState("low_risk_templates_only");
   const [selectedQuestionId, setSelectedQuestionId] = useState("");
   const [selectedThreadId, setSelectedThreadId] = useState("");
+  const [aftersaleFilter, setAftersaleFilter] = useState<"all" | "open" | "handoff" | "high">("all");
   const [csvEncoding, setCsvEncoding] = useState<CsvEncoding>("auto");
   const [draftText, setDraftText] = useState("");
   const [aftersaleReplyText, setAftersaleReplyText] = useState("");
@@ -317,7 +318,19 @@ export default function AppShell({ apiUrl }: AppShellProps) {
     () => threads.find((thread) => valueOf(thread, "id") === selectedThreadId) || threads[0],
     [threads, selectedThreadId]
   );
+  const filteredThreads = useMemo(() => {
+    if (aftersaleFilter === "open") return threads.filter((thread) => valueOf(thread, "status") === "open");
+    if (aftersaleFilter === "handoff") return threads.filter((thread) => valueOf(thread, "handoffRequired") === "true" || valueOf(thread, "status") === "human_pending");
+    if (aftersaleFilter === "high") return threads.filter((thread) => valueOf(thread, "riskLevel") === "high");
+    return threads;
+  }, [threads, aftersaleFilter]);
   const shopQuery = selectedShop ? `?shopId=${encodeURIComponent(selectedShop)}` : "";
+
+  function replaceThread(updatedThread: AnyRecord | undefined) {
+    if (!updatedThread?.id) return;
+    setThreads((current) => current.map((thread) => valueOf(thread, "id") === valueOf(updatedThread, "id") ? { ...thread, ...updatedThread } : thread));
+    setSelectedThreadId(valueOf(updatedThread, "id"));
+  }
 
   async function refresh() {
     const [nextDashboard, nextShops, nextSkus, nextDocs, nextQuestions, nextThreads, nextTemplates, nextReviews, nextFeishu, nextAutomation] = await Promise.all([
@@ -663,40 +676,40 @@ export default function AppShell({ apiUrl }: AppShellProps) {
     });
     const updatedThread = result.thread as AnyRecord | undefined;
     if (updatedThread?.id) {
-      setThreads((current) => current.map((thread) => valueOf(thread, "id") === valueOf(updatedThread, "id") ? { ...thread, ...updatedThread } : thread));
-      setSelectedThreadId(valueOf(updatedThread, "id"));
+      replaceThread(updatedThread);
     }
-    setAftersaleReplyText("");
+    setAftersaleReplyText(valueOf(updatedThread, "suggestedReply"));
     setAftersaleReferences(asList(result, "ragHits"));
   }
 
   async function sendAftersaleMessage() {
     if (!selectedThread) return;
     const threadId = valueOf(selectedThread, "id");
-    const analyzed = await requestJson(apiUrl, `/aftersale/threads/${threadId}/analyze`, {
-      method: "POST",
-      body: JSON.stringify({ shopId: selectedShop, dispatch: true })
-    });
     let thread = selectedThread;
-    const updatedThread = analyzed.thread as AnyRecord | undefined;
-    if (updatedThread?.id) {
-      thread = { ...thread, ...updatedThread };
-      setThreads((current) => current.map((item) => valueOf(item, "id") === valueOf(updatedThread, "id") ? { ...item, ...updatedThread } : item));
-      setSelectedThreadId(valueOf(updatedThread, "id"));
-      setAftersaleReplyText(valueOf(updatedThread, "suggestedReply"));
+    let replyText = aftersaleReplyText.trim() || valueOf(thread, "suggestedReply").trim();
+
+    if (!replyText) {
+      const analyzed = await requestJson(apiUrl, `/aftersale/threads/${threadId}/analyze`, {
+        method: "POST",
+        body: JSON.stringify({ shopId: selectedShop, dispatch: true })
+      });
+      const updatedThread = analyzed.thread as AnyRecord | undefined;
+      if (updatedThread?.id) {
+        thread = { ...thread, ...updatedThread };
+        replaceThread(updatedThread);
+        setAftersaleReplyText(valueOf(updatedThread, "suggestedReply"));
+      }
+      setAftersaleReferences(asList(analyzed, "ragHits"));
+      replyText = valueOf(thread, "suggestedReply").trim();
     }
-    setAftersaleReferences(asList(analyzed, "ragHits"));
-    if (valueOf(thread, "handoffRequired") === "true") return;
-    const replyText = aftersaleReplyText.trim() || valueOf(thread, "suggestedReply");
     if (!replyText) throw new Error("没有可发送的售后回复，请先维护对应预设回复。");
     const sent = await requestJson(apiUrl, `/aftersale/threads/${threadId}/send`, {
       method: "POST",
-      body: JSON.stringify({ shopId: selectedShop, replyText, dryRun: false })
+      body: JSON.stringify({ shopId: selectedShop, replyText, dryRun: false, allowLocalRecord: true })
     });
     const sentThread = sent.thread as AnyRecord | undefined;
     if (sentThread?.id) {
-      setThreads((current) => current.map((item) => valueOf(item, "id") === valueOf(sentThread, "id") ? { ...item, ...sentThread } : item));
-      setSelectedThreadId(valueOf(sentThread, "id"));
+      replaceThread(sentThread);
       setAftersaleReplyText("");
     }
   }
@@ -931,12 +944,18 @@ export default function AppShell({ apiUrl }: AppShellProps) {
         )}
 
         {tab === "aftersale" && (
-          <section className="workbench three">
+          <section className="workbench aftersale-workbench">
             <aside className="queue-panel">
               <h2>售后队列</h2>
+              <div className="mini-tabs aftersale-filter">
+                <button className={aftersaleFilter === "all" ? "active" : ""} onClick={() => setAftersaleFilter("all")}>全部</button>
+                <button className={aftersaleFilter === "open" ? "active" : ""} onClick={() => setAftersaleFilter("open")}>待跟进</button>
+                <button className={aftersaleFilter === "handoff" ? "active" : ""} onClick={() => setAftersaleFilter("handoff")}>转人工</button>
+                <button className={aftersaleFilter === "high" ? "active" : ""} onClick={() => setAftersaleFilter("high")}>高风险</button>
+              </div>
               <div className="mini-tabs"><button>全部</button><button>待跟进</button><button>转人工提醒</button><button>高风险</button></div>
               <div className="queue-list">
-                {threads.map((thread) => (
+                {filteredThreads.map((thread) => (
                   <button
                     key={valueOf(thread, "id")}
                     className={`queue-card ${valueOf(thread, "id") === valueOf(selectedThread, "id") ? "active" : ""}`}
@@ -947,10 +966,10 @@ export default function AppShell({ apiUrl }: AppShellProps) {
                     <em>{statusText(valueOf(thread, "status"))} · 风险 {statusText(valueOf(thread, "riskLevel"))} · {String(valueOf(thread, "messageCount") || asList(thread, "messages").length)} 条消息</em>
                   </button>
                 ))}
-                {!threads.length ? <div className="empty-state">暂无售后工单</div> : null}
+                {!filteredThreads.length ? <div className="empty-state">暂无售后工单</div> : null}
               </div>
             </aside>
-            <article className="detail-panel">
+            <article className="detail-panel aftersale-detail">
               <h2>售后对话闭环</h2>
               {selectedThread ? (
                 <>
@@ -980,7 +999,7 @@ export default function AppShell({ apiUrl }: AppShellProps) {
                 </>
               ) : <div className="empty-state">暂无售后消息</div>}
             </article>
-            <aside className="assist-panel">
+            <aside className="assist-panel aftersale-composer">
               <h2>售后自动回复</h2>
               <div className="reply-status">
                 <strong>{valueOf(selectedThread, "handoffLabel") || statusText(valueOf(selectedThread, "category"))}</strong>

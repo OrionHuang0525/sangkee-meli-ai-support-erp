@@ -302,6 +302,7 @@ async function notifyFeishuForHumanRequest(shopId: string, content: string) {
   const response = await fetch(webhookUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    signal: AbortSignal.timeout(8000),
     body: JSON.stringify(buildFeishuPayload(content, config.secretEnc ? decryptSecret(config.secretEnc) : ""))
   });
   if (!response.ok) console.warn("[feishu] human request notify failed", response.status, await response.text());

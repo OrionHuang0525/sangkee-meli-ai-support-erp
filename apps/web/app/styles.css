@@ -320,6 +320,31 @@ article,
   grid-template-columns: 300px minmax(0, 1fr) 390px;
 }
 
+.workbench.aftersale-workbench {
+  grid-template-columns: 320px minmax(0, 1fr);
+  grid-template-areas:
+    "queue detail"
+    "queue composer";
+  align-items: start;
+}
+
+.aftersale-workbench .queue-panel {
+  grid-area: queue;
+  position: sticky;
+  top: 20px;
+  max-height: calc(100vh - 106px);
+  overflow: auto;
+}
+
+.aftersale-detail {
+  grid-area: detail;
+  min-height: 430px;
+}
+
+.aftersale-composer {
+  grid-area: composer;
+}
+
 .queue-panel,
 .detail-panel,
 .assist-panel,
@@ -344,6 +369,17 @@ article,
   white-space: nowrap;
   padding: 0 10px;
   color: #506176;
+}
+
+.mini-tabs button.active {
+  border-color: #2f6fed;
+  background: #eef5ff;
+  color: #245cc5;
+  font-weight: 700;
+}
+
+.aftersale-filter + .mini-tabs {
+  display: none;
 }
 
 .queue-list {
@@ -409,6 +445,9 @@ article,
   display: grid;
   gap: 12px;
   margin-top: 14px;
+  max-height: calc(100vh - 260px);
+  min-height: 320px;
+  overflow: auto;
   padding: 12px;
   border: 1px solid #e5edf6;
   border-radius: 8px;
@@ -834,12 +873,25 @@ td button {
 }
 
 @media (max-width: 1180px) {
+  .workbench.aftersale-workbench,
   .workbench.three,
   .knowledge-layout,
   .columns,
   .stats-layout,
   .split {
     grid-template-columns: 1fr;
+  }
+
+  .workbench.aftersale-workbench {
+    grid-template-areas:
+      "queue"
+      "detail"
+      "composer";
+  }
+
+  .aftersale-workbench .queue-panel {
+    position: static;
+    max-height: none;
   }
 
   .metric-grid,

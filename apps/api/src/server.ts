@@ -367,6 +367,7 @@ async function sendFeishuWebhook(shopId: string, text: string) {
   const response = await fetch(config.webhookUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    signal: AbortSignal.timeout(8000),
     body: JSON.stringify(buildFeishuPayload(text, config.secret))
   });
   const body = await response.text();
@@ -3406,10 +3407,11 @@ app.post("/aftersale/threads/:id/send", async (req, res, next) => {
   try {
     const shopId = await resolveShopId(req, req.body?.shopId);
     const wantsRealSend = req.body?.dryRun === false;
-    if (wantsRealSend && process.env.AUTO_SEND_AFTERSALE !== "true") {
+    const allowLocalRecord = req.body?.allowLocalRecord === true;
+    if (wantsRealSend && process.env.AUTO_SEND_AFTERSALE !== "true" && !allowLocalRecord) {
       throw new HttpError(409, "Real Mercado Libre post-sale send is disabled. Set AUTO_SEND_AFTERSALE=true after OAuth and audit checks are ready.");
     }
-    const dryRun = !wantsRealSend;
+    const dryRun = !wantsRealSend || process.env.AUTO_SEND_AFTERSALE !== "true";
     const thread = await prisma.aftersaleThread.findFirst({ where: { id: String(req.params.id), shopId } });
     if (!thread) throw new HttpError(404, "thread not found");
     const replyText = String(req.body?.replyText || thread.suggestedReply || "").trim();
@@ -3431,7 +3433,7 @@ app.post("/aftersale/threads/:id/send", async (req, res, next) => {
       });
       await prisma.aftersaleThread.update({
         where: { id: thread.id },
-        data: { suggestedReply: replyText, lastMessageAt: now }
+        data: { suggestedReply: replyText, status: "closed", lastMessageAt: now }
       });
       await createOperationLog(req, {
         shopId,
